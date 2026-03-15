@@ -11,6 +11,6 @@
     "types": ["node"],
     "sourceMap": true
   },
-  "include": ["src/main/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts"],
+  "include": ["src/main/**/*.ts", "src/ai/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts"],
   "exclude": ["node_modules"]
 }

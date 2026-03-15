@@ -1,4 +1,4 @@
-export type RedditImportStage = 'reading' | 'parsing' | 'writing' | 'done'
+export type RedditImportStage = 'reading' | 'parsing' | 'writing' | 'analyzing' | 'training' | 'done'
 
 export type RedditImportProgress = {
   stage: RedditImportStage
@@ -44,6 +44,19 @@ export type RedditUpvoted = {
 
 export type RedditSubscription = {
   name: string
+}
+
+export type RedditSearchResultKind = 'comment' | 'post' | 'upvoted' | 'saved'
+
+export type RedditSearchResult = {
+  kind: RedditSearchResultKind
+  id: string
+  subreddit: string | null
+  createdAt: string | null
+  permalink: string | null
+  title?: string
+  snippet: string
+  score?: number
 }
 
 export type RedditDataset = {

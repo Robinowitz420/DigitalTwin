@@ -21,8 +21,10 @@ async function readCsv(filePath: string): Promise<CsvRow[]> {
   })
 
   if (parsed.errors.length > 0) {
-    const first = parsed.errors[0]
-    throw new Error(`CSV parse error in ${path.basename(filePath)}: ${first.message}`)
+    const fatal = parsed.errors.find((e) => e.code !== 'UndetectableDelimiter')
+    if (fatal) {
+      throw new Error(`CSV parse error in ${path.basename(filePath)}: ${fatal.message}`)
+    }
   }
 
   return parsed.data
@@ -78,9 +80,16 @@ export async function parseRedditExportFolder(
 ): Promise<RedditDataset> {
   const commentsPath = path.join(folderPath, 'comments.csv')
   const postsPath = path.join(folderPath, 'posts.csv')
+  const commentVotesPath = path.join(folderPath, 'comment_votes.csv')
+  const postVotesPath = path.join(folderPath, 'post_votes.csv')
   const upvotedPath = path.join(folderPath, 'upvoted.csv')
+
+  const savedCommentsPath = path.join(folderPath, 'saved_comments.csv')
+  const savedPostsPath = path.join(folderPath, 'saved_posts.csv')
   const savedPath = path.join(folderPath, 'saved.csv')
+
   const subredditsPath = path.join(folderPath, 'subreddits.csv')
+  const subscribedSubredditsPath = path.join(folderPath, 'subscribed_subreddits.csv')
 
   onProgress?.({ stage: 'parsing', percent: 15, message: 'Parsing comments.csv' })
   const commentRows = await safeReadCsv(commentsPath)
@@ -88,14 +97,19 @@ export async function parseRedditExportFolder(
   onProgress?.({ stage: 'parsing', percent: 30, message: 'Parsing posts.csv' })
   const postRows = await safeReadCsv(postsPath)
 
-  onProgress?.({ stage: 'parsing', percent: 45, message: 'Parsing upvoted.csv' })
+  onProgress?.({ stage: 'parsing', percent: 45, message: 'Parsing votes/upvotes' })
   const upvotedRows = await safeReadCsv(upvotedPath)
+  const commentVoteRows = await safeReadCsv(commentVotesPath)
+  const postVoteRows = await safeReadCsv(postVotesPath)
 
-  onProgress?.({ stage: 'parsing', percent: 60, message: 'Parsing saved.csv' })
+  onProgress?.({ stage: 'parsing', percent: 60, message: 'Parsing saved' })
   const savedRows = await safeReadCsv(savedPath)
+  const savedCommentRows = await safeReadCsv(savedCommentsPath)
+  const savedPostRows = await safeReadCsv(savedPostsPath)
 
-  onProgress?.({ stage: 'parsing', percent: 75, message: 'Parsing subreddits.csv' })
+  onProgress?.({ stage: 'parsing', percent: 75, message: 'Parsing subreddits' })
   const subredditRows = await safeReadCsv(subredditsPath)
+  const subscribedRows = await safeReadCsv(subscribedSubredditsPath)
 
   const comments: RedditComment[] = commentRows.map((r, idx) => ({
     id: normalizeId(r, 'comment', idx),
@@ -116,7 +130,7 @@ export async function parseRedditExportFolder(
     score: parseOptionalNumber(pick(r, ['score', 'ups', 'upvotes'])),
   }))
 
-  const upvoted: RedditUpvoted[] = upvotedRows.map((r, idx) => ({
+  const legacyUpvoted: RedditUpvoted[] = upvotedRows.map((r, idx) => ({
     id: normalizeId(r, 'upvoted', idx),
     subreddit: normalizeSubreddit(pick(r, ['subreddit', 'community'])),
     permalink: normalizePermalink(pick(r, ['permalink', 'link', 'url'])),
@@ -124,7 +138,27 @@ export async function parseRedditExportFolder(
     createdAt: normalizeDate(pick(r, ['created_at', 'created', 'timestamp', 'date'])),
   }))
 
-  const saved: RedditSaved[] = savedRows.map((r, idx) => ({
+  const voteRows = [...commentVoteRows, ...postVoteRows]
+  const voteUpvoted: RedditUpvoted[] = voteRows
+    .filter((r) => {
+      const direction = pick(r, ['direction', 'vote', 'vote_direction', 'voteDirection'])
+      const dirNum = direction != null ? Number(direction) : NaN
+      if (!Number.isNaN(dirNum)) return dirNum === 1
+
+      const d = (direction ?? '').toLowerCase().trim()
+      return d === '1' || d === 'up' || d === 'upvote' || d === 'upvoted'
+    })
+    .map((r, idx) => ({
+      id: normalizeId(r, 'upvoted', idx),
+      subreddit: normalizeSubreddit(pick(r, ['subreddit', 'community', 'subreddit_name'])),
+      permalink: normalizePermalink(pick(r, ['permalink', 'link', 'url'])),
+      title: pick(r, ['title', 'subject', 'link_title']),
+      createdAt: normalizeDate(pick(r, ['created_at', 'created', 'timestamp', 'date', 'vote_date'])),
+    }))
+
+  const upvoted: RedditUpvoted[] = [...voteUpvoted, ...legacyUpvoted]
+
+  const legacySaved: RedditSaved[] = savedRows.map((r, idx) => ({
     id: normalizeId(r, 'saved', idx),
     subreddit: normalizeSubreddit(pick(r, ['subreddit', 'community'])),
     permalink: normalizePermalink(pick(r, ['permalink', 'link', 'url'])),
@@ -132,8 +166,18 @@ export async function parseRedditExportFolder(
     createdAt: normalizeDate(pick(r, ['created_at', 'created', 'timestamp', 'date'])),
   }))
 
-  const subreddits: RedditSubscription[] = subredditRows
-    .map((r) => normalizeSubreddit(pick(r, ['name', 'subreddit', 'community'])))
+  const savedFromSplit = [...savedCommentRows, ...savedPostRows].map((r, idx) => ({
+    id: normalizeId(r, 'saved', idx),
+    subreddit: normalizeSubreddit(pick(r, ['subreddit', 'community', 'subreddit_name'])),
+    permalink: normalizePermalink(pick(r, ['permalink', 'link', 'url'])),
+    title: pick(r, ['title', 'subject', 'link_title']),
+    createdAt: normalizeDate(pick(r, ['created_at', 'created', 'timestamp', 'date'])),
+  }))
+
+  const saved: RedditSaved[] = [...savedFromSplit, ...legacySaved]
+
+  const subreddits: RedditSubscription[] = [...subredditRows, ...subscribedRows]
+    .map((r) => normalizeSubreddit(pick(r, ['name', 'subreddit', 'community', 'subreddit_name'])))
     .filter((v): v is string => v != null)
     .map((name) => ({ name }))
 

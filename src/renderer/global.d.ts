@@ -1,4 +1,4 @@
-import type { DigitalTwinApi } from '../main/preload'
+import type { DigitalTwinApi } from '../main/preload.js'
 
 declare global {
   interface Window {

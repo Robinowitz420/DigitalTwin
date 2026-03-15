@@ -1,5 +1,6 @@
 import * as path from 'node:path'
 import { writeFile } from 'node:fs/promises'
+import { app } from 'electron'
 import { parseRedditExportFolder } from '../utils/redditParser.js'
 import type { RedditDataset, RedditImportProgress } from '../types/reddit.types.js'
 
@@ -15,7 +16,7 @@ export async function importRedditExportFromFolder(
 
   onProgress?.({ stage: 'writing', percent: 95 })
 
-  const outPath = path.join(folderPath, 'digital-twin.reddit.normalized.json')
+  const outPath = path.join(app.getPath('userData'), 'reddit.normalized.json')
   await writeFile(outPath, JSON.stringify(dataset, null, 2), 'utf8')
 
   onProgress?.({ stage: 'done', percent: 100, outputPath: outPath })

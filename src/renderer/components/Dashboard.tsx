@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Bar,
   BarChart,
@@ -27,6 +27,17 @@ function groupByDay(isoDates: Array<string | null | undefined>) {
 
 export default function Dashboard() {
   const [dataset, setDataset] = useState<RedditDataset | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const latest = await window.digitalTwin?.loadLatestRedditDataset?.()
+      if (!cancelled && latest) setDataset(latest)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const stats: Stat[] = useMemo(() => {
     if (!dataset) {
