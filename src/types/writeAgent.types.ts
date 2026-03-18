@@ -13,11 +13,28 @@ export type WriteAgentPreset = {
   values: WriteAgentSliders
 }
 
+export type WriteAgentVoiceMode =
+  | 'personal_text'
+  | 'close_friend'
+  | 'public_post'
+  | 'professional'
+  | 'unfiltered_me'
+
+export type WriteAgentSourceLocks = {
+  includeSms?: boolean
+  includeReddit?: boolean
+  includeGmail?: boolean
+}
+
 export type WriteAgentRequest = {
   topic: string
-  sliders: WriteAgentSliders
+  sliders?: WriteAgentSliders
+  voiceMode?: WriteAgentVoiceMode
+  blendFactor?: number // 0..1, optional interpolation between voice modes
+  sourceLocks?: WriteAgentSourceLocks
   model?: string
   handle?: string
+  contactName?: string // Optional: only load contact profile when specified
 }
 
 export type WriteAgentResult = {

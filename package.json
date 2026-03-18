@@ -18,11 +18,14 @@
     "dotenv": "^17.3.1",
     "node": "^25.6.1",
     "nvm": "^0.0.4",
+    "ollama": "^0.6.3",
+    "openai": "^6.31.0",
     "papaparse": "^5.5.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.13.0",
-    "recharts": "^3.7.0"
+    "recharts": "^3.7.0",
+    "tiktoken": "^1.0.22"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

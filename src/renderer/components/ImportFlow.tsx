@@ -28,7 +28,10 @@ export default function ImportFlow({ onImported }: Props) {
   const [gmailFilePath, setGmailFilePath] = useState<string | null>(null)
   const [socialCsvFilePath, setSocialCsvFilePath] = useState<string | null>(null)
   const [takeoutFolderPath, setTakeoutFolderPath] = useState<string | null>(null)
-  const [portalBusy, setPortalBusy] = useState<null | 'gmail' | 'social_csv' | 'takeout_all'>(null)
+  const [igMessagesFolderPath, setIgMessagesFolderPath] = useState<string | null>(null)
+  const [igCommentsFolderPath, setIgCommentsFolderPath] = useState<string | null>(null)
+  const [llmChatFolderPath, setLlmChatFolderPath] = useState<string | null>(null)
+  const [portalBusy, setPortalBusy] = useState<null | 'gmail' | 'social_csv' | 'takeout_all' | 'ig_messages' | 'ig_comments' | 'llm_chat'>(null)
   const [sourceCounts, setSourceCounts] = useState<Record<string, number>>({})
   const [guide, setGuide] = useState<'reddit' | 'gmail' | 'social' | 'takeout' | 'sms'>('gmail')
   const [socialHeaders, setSocialHeaders] = useState<string[]>([])
@@ -37,6 +40,10 @@ export default function ImportFlow({ onImported }: Props) {
     textColumn: '',
   })
   const [hasIdentityProfile, setHasIdentityProfile] = useState(false)
+  const [voiceProfileData, setVoiceProfileData] = useState<{ 
+    trainedAt?: string
+    trainingSources?: { redditComments: number; redditPosts: number; smsMessages: number }
+  } | null>(null)
 
   useEffect(() => {
     const off = window.digitalTwin?.onRedditImportProgress((p) => setProgress(p))
@@ -85,6 +92,13 @@ export default function ImportFlow({ onImported }: Props) {
           onImported(latest)
         }
         setHasVoiceProfile(voiceProfile != null)
+        if (voiceProfile && typeof voiceProfile === 'object') {
+          const vp = voiceProfile as { trainedAt?: string; trainingSources?: { redditComments: number; redditPosts: number; smsMessages: number } }
+          setVoiceProfileData({
+            trainedAt: vp.trainedAt,
+            trainingSources: vp.trainingSources,
+          })
+        }
         const identityProfile = await window.digitalTwin.loadIdentityProfile()
         if (!cancelled) setHasIdentityProfile(identityProfile != null)
         const counts = await window.digitalTwin.loadIdentitySourceCounts()
@@ -133,6 +147,15 @@ export default function ImportFlow({ onImported }: Props) {
     try {
       await window.digitalTwin.trainVoiceProfile()
       setHasVoiceProfile(true)
+      // Reload voice profile to get training metadata
+      const vp = await window.digitalTwin.loadVoiceProfile()
+      if (vp && typeof vp === 'object') {
+        const vpData = vp as { trainedAt?: string; trainingSources?: { redditComments: number; redditPosts: number; smsMessages: number } }
+        setVoiceProfileData({
+          trainedAt: vpData.trainedAt,
+          trainingSources: vpData.trainingSources,
+        })
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Training failed')
     } finally {
@@ -191,14 +214,122 @@ export default function ImportFlow({ onImported }: Props) {
       const preview = await window.digitalTwin.previewSocialCsvFile(selected)
       setSocialHeaders(preview.headers)
       setSocialSampleRows(preview.sampleRows)
-      const pick = (...keys: string[]) => preview.headers.find((h) => keys.includes(h.toLowerCase().trim())) ?? ''
+      const norm = (s: string) => s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '')
+      const headers = preview.headers
+      const headerNorm = new Map<string, string>()
+      for (const h of headers) headerNorm.set(h, norm(h))
+      const sampleRows = preview.sampleRows
+
+      const valuesFor = (header: string) => sampleRows.map((r) => (r?.[header] ?? '').toString())
+      const nonEmptyValuesFor = (header: string) => valuesFor(header).map((v) => v.trim()).filter(Boolean)
+
+      const parseDateScore = (header: string) => {
+        const vals = nonEmptyValuesFor(header)
+        if (vals.length === 0) return 0
+        let ok = 0
+        for (const v of vals) {
+          const d = new Date(v)
+          if (Number.isFinite(d.getTime())) ok++
+        }
+        return ok / vals.length
+      }
+
+      const avgLenScore = (header: string) => {
+        const vals = nonEmptyValuesFor(header)
+        if (vals.length === 0) return 0
+        const total = vals.reduce((acc, v) => acc + v.length, 0)
+        return total / vals.length
+      }
+
+      const isMostlyNumeric = (header: string) => {
+        const vals = nonEmptyValuesFor(header)
+        if (vals.length === 0) return false
+        let ok = 0
+        for (const v of vals) {
+          const t = v.replace(/\s+/g, '')
+          if (t && /^[0-9]+$/.test(t)) ok++
+        }
+        return ok / vals.length >= 0.7
+      }
+
+      const hasUrlLike = (header: string) => {
+        const vals = nonEmptyValuesFor(header)
+        if (vals.length === 0) return false
+        return vals.some((v) => /^https?:\/\//i.test(v) || /^www\./i.test(v))
+      }
+
+      const bestHeaderBy = (scoreFn: (h: string) => number, allow: (h: string) => boolean = () => true) => {
+        let best = ''
+        let bestScore = -Infinity
+        for (const h of headers) {
+          if (!allow(h)) continue
+          const score = scoreFn(h)
+          if (score > bestScore) {
+            bestScore = score
+            best = h
+          }
+        }
+        return best
+      }
+
+      const pickByHeaderHints = (hints: string[]) => {
+        const hintNorms = hints.map(norm)
+        const scored = headers
+          .map((h) => {
+            const hn = headerNorm.get(h) ?? ''
+            let score = 0
+            for (const k of hintNorms) {
+              if (!k) continue
+              if (hn === k) score += 6
+              if (hn.includes(k)) score += 4
+              if (k.includes(hn)) score += 1
+            }
+            return { h, score }
+          })
+          .sort((a, b) => b.score - a.score)
+        return scored[0]?.score ? scored[0].h : ''
+      }
+
+      const textHint = pickByHeaderHints(['text', 'message', 'body', 'content', 'caption', 'post', 'comment', 'title', 'msg'])
+      const dateHint = pickByHeaderHints(['created_at', 'createdat', 'timestamp', 'time', 'date', 'sent_at', 'sentat', 'datetime'])
+      const authorHint = pickByHeaderHints(['author', 'user', 'from', 'sender', 'username', 'handle', 'name'])
+      const recipientHint = pickByHeaderHints(['to', 'recipient', 'target', 'receiver', 'thread', 'contact'])
+      const channelHint = pickByHeaderHints(['platform', 'source', 'channel', 'app', 'subreddit', 'service'])
+      const idHint = pickByHeaderHints(['id', 'message_id', 'msg_id', 'post_id', 'comment_id', 'uuid', 'guid'])
+
+      const textColumn =
+        textHint ||
+        bestHeaderBy(
+          (h) => {
+            const avg = avgLenScore(h)
+            const dateScore = parseDateScore(h)
+            const bad = (isMostlyNumeric(h) ? 25 : 0) + (dateScore >= 0.7 ? 25 : 0) + (hasUrlLike(h) ? 10 : 0)
+            return avg - bad
+          },
+          (h) => nonEmptyValuesFor(h).length > 0,
+        )
+
+      const dateColumn =
+        dateHint ||
+        bestHeaderBy(
+          (h) => {
+            const s = parseDateScore(h)
+            const hn = headerNorm.get(h) ?? ''
+            const headerBonus = /date|time|timestamp|created|sent/.test(hn) ? 0.25 : 0
+            return s + headerBonus
+          },
+          (h) => nonEmptyValuesFor(h).length > 0,
+        )
+
+      const idColumn = idHint || bestHeaderBy((h) => (isMostlyNumeric(h) ? 1 : 0) + (/(^|_)(id|uuid|guid)($|_)/.test(headerNorm.get(h) ?? '') ? 0.5 : 0))
+
       setSocialMapping({
-        textColumn: pick('text', 'message', 'body', 'content', 'caption'),
-        dateColumn: pick('created_at', 'createdat', 'timestamp', 'date', 'time') || undefined,
-        authorColumn: pick('author', 'user', 'from', 'sender') || undefined,
-        recipientColumn: pick('to', 'recipient', 'target') || undefined,
-        channelColumn: pick('platform', 'source', 'channel', 'subreddit') || undefined,
-        idColumn: pick('id', 'message_id', 'post_id', 'comment_id') || undefined,
+        textColumn: textColumn || '',
+        dateColumn: dateColumn && parseDateScore(dateColumn) >= 0.6 ? dateColumn : undefined,
+        authorColumn: authorHint || undefined,
+        recipientColumn: recipientHint || undefined,
+        channelColumn: channelHint || undefined,
+        idColumn: idColumn || undefined,
       })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to parse CSV preview')
@@ -257,6 +388,66 @@ export default function ImportFlow({ onImported }: Props) {
     }
   }
 
+  async function chooseIgMessagesFolder() {
+    setError(null)
+    const selected = await window.digitalTwin.selectInstagramMessagesFolder()
+    setIgMessagesFolderPath(selected)
+  }
+
+  async function chooseIgCommentsFolder() {
+    setError(null)
+    const selected = await window.digitalTwin.selectInstagramCommentsFolder()
+    setIgCommentsFolderPath(selected)
+  }
+
+  async function runIgMessagesImport() {
+    if (!igMessagesFolderPath) return
+    setPortalBusy('ig_messages')
+    setError(null)
+    try {
+      await window.digitalTwin.importInstagramMessagesFromFolder(igMessagesFolderPath)
+      await refreshSourceCounts()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Instagram messages import failed')
+    } finally {
+      setPortalBusy(null)
+    }
+  }
+
+  async function runIgCommentsImport() {
+    if (!igCommentsFolderPath) return
+    setPortalBusy('ig_comments')
+    setError(null)
+    try {
+      await window.digitalTwin.importInstagramCommentsFromFolder(igCommentsFolderPath)
+      await refreshSourceCounts()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Instagram comments import failed')
+    } finally {
+      setPortalBusy(null)
+    }
+  }
+
+  async function chooseLLMChatFolder() {
+    setError(null)
+    const selected = await window.digitalTwin.selectLLMChatFolder()
+    setLlmChatFolderPath(selected)
+  }
+
+  async function runLLMChatImport() {
+    if (!llmChatFolderPath) return
+    setPortalBusy('llm_chat')
+    setError(null)
+    try {
+      await window.digitalTwin.importLLMChatFolder(llmChatFolderPath)
+      await refreshSourceCounts()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'LLM chat import failed')
+    } finally {
+      setPortalBusy(null)
+    }
+  }
+
   return (
     <div
       className={`mt-5 rounded-lg border border-dashed p-5 text-sm transition-colors ${
@@ -293,9 +484,85 @@ export default function ImportFlow({ onImported }: Props) {
 
         {(hasDataset || hasVoiceProfile) && (
           <div className="mt-4 rounded-lg border border-emerald-400/20 bg-emerald-500/10 p-3 text-xs text-emerald-100/90">
-            <div>Saved locally:</div>
-            <div className="mt-1">Dataset: {hasDataset ? 'ready' : 'missing'}</div>
-            <div>DigitalYou voice profile: {hasVoiceProfile ? 'ready' : 'not built yet'}</div>
+            <div className="font-medium text-white mb-2">Data Status</div>
+            <div className="grid gap-1">
+              <div className="flex justify-between">
+                <span>Reddit dataset:</span>
+                <span className="text-white">{hasDataset ? 'imported' : 'missing'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Voice profile:</span>
+                <span className="text-white">{hasVoiceProfile ? 'trained' : 'not built'}</span>
+              </div>
+              {voiceProfileData?.trainedAt && (
+                <div className="flex justify-between text-white/60">
+                  <span>Last trained:</span>
+                  <span>{new Date(voiceProfileData.trainedAt).toLocaleDateString()}</span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Data Assimilation Visualization */}
+        {(Object.keys(sourceCounts).length > 0 || voiceProfileData) && (
+          <div className="mt-4 rounded-lg border border-white/10 bg-black/20 p-3">
+            <div className="text-xs font-medium text-white/80 mb-2">Data Assimilation</div>
+            
+            {/* Imported Data */}
+            <div className="mb-3">
+              <div className="text-[10px] text-white/50 uppercase tracking-wide mb-1">Imported to Timeline</div>
+              <div className="flex flex-wrap gap-1">
+                {Object.entries(sourceCounts).map(([source, count]) => (
+                  <span 
+                    key={source} 
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-white/10 text-[11px] text-white/80"
+                  >
+                    <span className="text-white/50">{source.replace('_', ' ')}:</span>
+                    <span className="text-white font-medium">{count.toLocaleString()}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* Trained into Voice */}
+            {voiceProfileData?.trainingSources && (
+              <div>
+                <div className="text-[10px] text-white/50 uppercase tracking-wide mb-1">Trained into Voice</div>
+                <div className="flex flex-wrap gap-1">
+                  {voiceProfileData.trainingSources.redditComments > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-purple-500/20 text-[11px] text-purple-200">
+                      <span className="text-purple-300/70">Reddit comments:</span>
+                      <span className="font-medium">{voiceProfileData.trainingSources.redditComments.toLocaleString()}</span>
+                    </span>
+                  )}
+                  {voiceProfileData.trainingSources.redditPosts > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-purple-500/20 text-[11px] text-purple-200">
+                      <span className="text-purple-300/70">Reddit posts:</span>
+                      <span className="font-medium">{voiceProfileData.trainingSources.redditPosts.toLocaleString()}</span>
+                    </span>
+                  )}
+                  {voiceProfileData.trainingSources.smsMessages > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-500/20 text-[11px] text-blue-200">
+                      <span className="text-blue-300/70">SMS messages:</span>
+                      <span className="font-medium">{voiceProfileData.trainingSources.smsMessages.toLocaleString()}</span>
+                    </span>
+                  )}
+                </div>
+                {voiceProfileData.trainingSources.smsMessages === 0 && sourceCounts.sms > 0 && (
+                  <div className="mt-2 text-[10px] text-amber-300/80">
+                    ⚠️ SMS imported but not trained — rebuild voice profile to include
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Not trained warning */}
+            {!voiceProfileData?.trainingSources && Object.keys(sourceCounts).length > 0 && (
+              <div className="text-[10px] text-amber-300/80">
+                ⚠️ Data imported but voice not trained — click "Build a copy of me" to assimilate
+              </div>
+            )}
           </div>
         )}
 
@@ -558,7 +825,12 @@ export default function ImportFlow({ onImported }: Props) {
 
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <div className="rounded-lg border border-white/10 bg-black/30 p-3">
-              <div className="text-sm text-white">Gmail (JSON)</div>
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">Gmail (JSON)</div>
+                {(sourceCounts.gmail ?? 0) > 0 && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
               <div className="mt-1 text-xs text-white/50">Imported records: {sourceCounts.gmail ?? 0}</div>
               <div className="mt-3 flex flex-col gap-2">
                 <button
@@ -579,7 +851,12 @@ export default function ImportFlow({ onImported }: Props) {
             </div>
 
             <div className="rounded-lg border border-white/10 bg-black/30 p-3">
-              <div className="text-sm text-white">Social CSV</div>
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">Social CSV</div>
+                {(sourceCounts.social_csv ?? 0) > 0 && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
               <div className="mt-1 text-xs text-white/50">Imported records: {sourceCounts.social_csv ?? 0}</div>
               <div className="mt-3 flex flex-col gap-2">
                 <button
@@ -663,7 +940,12 @@ export default function ImportFlow({ onImported }: Props) {
             </div>
 
             <div className="rounded-lg border border-white/10 bg-black/30 p-3">
-              <div className="text-sm text-white">Google Takeout (All-in-one)</div>
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">Google Takeout (All-in-one)</div>
+                {((sourceCounts.chrome ?? 0) + (sourceCounts.discover ?? 0) + (sourceCounts.google_voice ?? 0) + (sourceCounts.youtube ?? 0)) > 0 && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
               <div className="mt-1 text-xs text-white/50">
                 Imported records: Gmail {sourceCounts.gmail ?? 0} · Chrome {sourceCounts.chrome ?? 0} · Discover {sourceCounts.discover ?? 0} · Voice {sourceCounts.google_voice ?? 0} · YouTube {sourceCounts.youtube ?? 0}
               </div>
@@ -681,6 +963,99 @@ export default function ImportFlow({ onImported }: Props) {
                   disabled={!takeoutFolderPath || portalBusy != null}
                 >
                   {portalBusy === 'takeout_all' ? 'Importing…' : 'Import Takeout (All)'}
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">Instagram Messages</div>
+                {(sourceCounts.instagram ?? 0) > 0 && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
+              <div className="mt-1 text-xs text-white/50">
+                Imported records: {sourceCounts.instagram ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-white/40">
+                Folder: your_instagram_activity/messages/inbox
+              </div>
+              <div className="mt-3 flex flex-col gap-2">
+                <button
+                  className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
+                  onClick={chooseIgMessagesFolder}
+                  disabled={portalBusy != null}
+                >
+                  Choose Messages folder
+                </button>
+                <button
+                  className="rounded-lg bg-pink-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-pink-500 transition-colors disabled:opacity-50"
+                  onClick={runIgMessagesImport}
+                  disabled={!igMessagesFolderPath || portalBusy != null}
+                >
+                  {portalBusy === 'ig_messages' ? 'Importing…' : 'Import Instagram Messages'}
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">Instagram Comments</div>
+                {(sourceCounts.instagram ?? 0) > 0 && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
+              <div className="mt-1 text-xs text-white/50">
+                Imported records: {sourceCounts.instagram ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-white/40">
+                Folder: your_instagram_activity/comments
+              </div>
+              <div className="mt-3 flex flex-col gap-2">
+                <button
+                  className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
+                  onClick={chooseIgCommentsFolder}
+                  disabled={portalBusy != null}
+                >
+                  Choose Comments folder
+                </button>
+                <button
+                  className="rounded-lg bg-pink-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-pink-500 transition-colors disabled:opacity-50"
+                  onClick={runIgCommentsImport}
+                  disabled={!igCommentsFolderPath || portalBusy != null}
+                >
+                  {portalBusy === 'ig_comments' ? 'Importing…' : 'Import Instagram Comments'}
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">LLM Chats (ChatGPT, Claude, etc.)</div>
+                {(sourceCounts.llm_chat ?? 0) > 0 && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
+              <div className="mt-1 text-xs text-white/50">
+                Imported records: {sourceCounts.llm_chat ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-white/40">
+                Your prompts from ChatGPT, Claude, and other LLM conversations
+              </div>
+              <div className="mt-3 flex flex-col gap-2">
+                <button
+                  className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
+                  onClick={chooseLLMChatFolder}
+                  disabled={portalBusy != null}
+                >
+                  Choose LLM Export folder
+                </button>
+                <button
+                  className="rounded-lg bg-violet-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-violet-500 transition-colors disabled:opacity-50"
+                  onClick={runLLMChatImport}
+                  disabled={!llmChatFolderPath || portalBusy != null}
+                >
+                  {portalBusy === 'llm_chat' ? 'Importing…' : 'Import LLM Chats'}
                 </button>
               </div>
             </div>

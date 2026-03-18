@@ -7,6 +7,8 @@ export type IdentitySource =
   | 'discover'
   | 'google_voice'
   | 'youtube'
+  | 'instagram'
+  | 'llm_chat'
 
 export type IdentityEvent = {
   source: IdentitySource

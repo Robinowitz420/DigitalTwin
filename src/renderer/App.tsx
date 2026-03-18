@@ -1,7 +1,7 @@
 import { Navigate, NavLink, Route, Routes } from 'react-router-dom'
 import WhoAmI from './pages/WhoAmI'
-import DigitalTwin from './pages/DigitalTwin'
 import WriteLikeMe from './pages/WriteLikeMe.tsx'
+import Tools from './pages/Tools'
 
 export default function App() {
   const tabBase =
@@ -27,16 +27,16 @@ export default function App() {
               Who Am I
             </NavLink>
             <NavLink
-              to="/time"
-              className={({ isActive }) => tabBase + (isActive ? tabActive : tabInactive)}
-            >
-              Time Machine
-            </NavLink>
-            <NavLink
               to="/write"
               className={({ isActive }) => tabBase + (isActive ? tabActive : tabInactive)}
             >
               Write Like Me
+            </NavLink>
+            <NavLink
+              to="/tools"
+              className={({ isActive }) => tabBase + (isActive ? tabActive : tabInactive)}
+            >
+              Tools
             </NavLink>
           </nav>
         </header>
@@ -44,8 +44,8 @@ export default function App() {
         <main className="mt-6 flex-1">
           <Routes>
             <Route path="/" element={<WhoAmI />} />
-            <Route path="/time" element={<DigitalTwin />} />
             <Route path="/write" element={<WriteLikeMe />} />
+            <Route path="/tools" element={<Tools />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>

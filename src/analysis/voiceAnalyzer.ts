@@ -36,6 +36,57 @@ export type VoiceProfile = {
 
   representativeExamples: string[]
   highEngagementExamples: string[]
+
+  // Training metadata - tracks what data was used
+  trainedAt?: string // ISO timestamp when training completed
+  trainingSources?: {
+    redditComments: number
+    redditPosts: number
+    smsMessages: number
+  }
+}
+
+// Per-contact voice profile for adapting style based on relationship
+export type PerContactVoiceProfile = {
+  contactName: string
+  contactPhone?: string | null
+  
+  // Relationship metadata
+  relationshipType: 'close_friend' | 'friend' | 'family' | 'acquaintance' | 'professional' | 'unknown'
+  intimacyScore: number // 0-1, based on message frequency, slang usage, emoji usage
+  
+  // User's style when talking to THIS contact
+  userStyle: {
+    avgMessageLength: number
+    emojiUsageRate: number // emojis per message
+    slangUsageRate: number // lol, lmao, etc per message
+    questionRate: number // questions per message
+    exclamationRate: number
+    responseTimeMinutes?: number // average time to respond
+    initiationsCount: number // how often user starts conversation
+  }
+  
+  // Contact's style (for context)
+  contactStyle: {
+    avgMessageLength: number
+    emojiUsageRate: number
+    slangUsageRate: number
+  }
+  
+  // Shared context
+  sharedPhrases: string[] // inside jokes, recurring phrases
+  topicsDiscussed: Array<{ topic: string; count: number }>
+  
+  // Conversation patterns
+  totalMessages: number
+  userMessages: number
+  contactMessages: number
+  firstMessageDate: string | null
+  lastMessageDate: string | null
+  
+  // Sample messages for AI context
+  representativeUserMessages: string[] // user's messages to this contact
+  representativeContactMessages: string[] // contact's messages for context
 }
 
 type AnalyzeVoiceInput = {
@@ -298,5 +349,142 @@ export function analyzeVoice(input: AnalyzeVoiceInput): VoiceProfile {
 
     representativeExamples: rep,
     highEngagementExamples: high,
+  }
+}
+
+// Analyze user's communication style with a specific contact
+export function analyzePerContactVoice(messages: Array<{
+  text: string
+  isUserMessage: boolean
+  timestamp?: string | null
+  senderName?: string
+}>): PerContactVoiceProfile | null {
+  if (messages.length < 3) return null // Need minimum conversation
+  
+  const userMessages = messages.filter(m => m.isUserMessage)
+  const contactMessages = messages.filter(m => !m.isUserMessage)
+  
+  if (userMessages.length < 2 || contactMessages.length < 2) return null // Need back-and-forth
+  
+  // Extract contact name from first non-user message
+  const contactName = contactMessages[0]?.senderName ?? 'Unknown'
+  
+  // Analyze user's style with this contact
+  const userTexts = userMessages.map(m => m.text)
+  const contactTexts = contactMessages.map(m => m.text)
+  
+  // Emoji detection
+  const emojiRe = /[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu
+  const userEmojiCount = userTexts.reduce((sum, t) => sum + (t.match(emojiRe)?.length ?? 0), 0)
+  const contactEmojiCount = contactTexts.reduce((sum, t) => sum + (t.match(emojiRe)?.length ?? 0), 0)
+  
+  // Slang detection
+  const slangRe = /\b(lol|lmao|tbh|imo|imho|idk|ngl|ya|yep|nah|gonna|wanna|bruh|fam|bestie|sis|bro)\b/gi
+  const userSlangCount = userTexts.reduce((sum, t) => sum + (t.match(slangRe)?.length ?? 0), 0)
+  const contactSlangCount = contactTexts.reduce((sum, t) => sum + (t.match(slangRe)?.length ?? 0), 0)
+  
+  // Questions and exclamations
+  const userQuestions = userTexts.reduce((sum, t) => sum + (t.match(/\?/g)?.length ?? 0), 0)
+  const userExclamations = userTexts.reduce((sum, t) => sum + (t.match(/!/g)?.length ?? 0), 0)
+  
+  // Message lengths
+  const userLengths = userTexts.map(t => t.length)
+  const contactLengths = contactTexts.map(t => t.length)
+  const avgUserLen = userLengths.length > 0 ? userLengths.reduce((a, b) => a + b, 0) / userLengths.length : 0
+  const avgContactLen = contactLengths.length > 0 ? contactLengths.reduce((a, b) => a + b, 0) / contactLengths.length : 0
+  
+  // Calculate intimacy score (0-1)
+  const emojiRate = userMessages.length > 0 ? userEmojiCount / userMessages.length : 0
+  const slangRate = userMessages.length > 0 ? userSlangCount / userMessages.length : 0
+  const intimacyScore = clamp01((emojiRate * 2 + slangRate * 2 + (userExclamations / userMessages.length)) / 5)
+  
+  // Determine relationship type based on patterns
+  let relationshipType: PerContactVoiceProfile['relationshipType'] = 'unknown'
+  if (intimacyScore > 0.6 && slangRate > 0.3) {
+    relationshipType = 'close_friend'
+  } else if (intimacyScore > 0.4 || slangRate > 0.2) {
+    relationshipType = 'friend'
+  } else if (avgUserLen > 100 && userQuestions / userMessages.length > 0.5) {
+    relationshipType = 'professional'
+  } else if (intimacyScore > 0.3) {
+    relationshipType = 'acquaintance'
+  }
+  
+  // Extract shared phrases (n-grams that appear in both sides)
+  const userPhrases = new Map<string, number>()
+  const contactPhrases = new Map<string, number>()
+  
+  for (const t of userTexts) {
+    const toks = words(t)
+    const grams = extractNgrams(toks, 2)
+    for (const g of grams) {
+      if (!STOPWORDS.has(g.split(' ')[0])) {
+        userPhrases.set(g, (userPhrases.get(g) ?? 0) + 1)
+      }
+    }
+  }
+  for (const t of contactTexts) {
+    const toks = words(t)
+    const grams = extractNgrams(toks, 2)
+    for (const g of grams) {
+      if (!STOPWORDS.has(g.split(' ')[0])) {
+        contactPhrases.set(g, (contactPhrases.get(g) ?? 0) + 1)
+      }
+    }
+  }
+  
+  const sharedPhrases: string[] = []
+  for (const [phrase, count] of userPhrases) {
+    if (contactPhrases.has(phrase) && count >= 2) {
+      sharedPhrases.push(phrase)
+    }
+  }
+  
+  // Sort dates
+  const dates = messages
+    .map(m => m.timestamp)
+    .filter((d): d is string => Boolean(d))
+    .sort()
+  
+  // Representative samples
+  const representativeUserMessages = userTexts
+    .filter(t => t.length > 10 && t.length < 200)
+    .slice(0, 10)
+  const representativeContactMessages = contactTexts
+    .filter(t => t.length > 10 && t.length < 200)
+    .slice(0, 10)
+  
+  return {
+    contactName,
+    
+    relationshipType,
+    intimacyScore,
+    
+    userStyle: {
+      avgMessageLength: avgUserLen,
+      emojiUsageRate: userMessages.length > 0 ? userEmojiCount / userMessages.length : 0,
+      slangUsageRate: userMessages.length > 0 ? userSlangCount / userMessages.length : 0,
+      questionRate: userMessages.length > 0 ? userQuestions / userMessages.length : 0,
+      exclamationRate: userMessages.length > 0 ? userExclamations / userMessages.length : 0,
+      initiationsCount: 0, // Would need conversation-level analysis
+    },
+    
+    contactStyle: {
+      avgMessageLength: avgContactLen,
+      emojiUsageRate: contactMessages.length > 0 ? contactEmojiCount / contactMessages.length : 0,
+      slangUsageRate: contactMessages.length > 0 ? contactSlangCount / contactMessages.length : 0,
+    },
+    
+    sharedPhrases: sharedPhrases.slice(0, 20),
+    topicsDiscussed: [], // Would need NLP topic extraction
+    
+    totalMessages: messages.length,
+    userMessages: userMessages.length,
+    contactMessages: contactMessages.length,
+    firstMessageDate: dates[0] ?? null,
+    lastMessageDate: dates[dates.length - 1] ?? null,
+    
+    representativeUserMessages,
+    representativeContactMessages,
   }
 }

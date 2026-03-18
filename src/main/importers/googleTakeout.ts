@@ -3,6 +3,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import Papa from 'papaparse'
 import type { IdentityEvent } from '../../types/identity.types.js'
 import { importGmailEventsFromJson, importGmailEventsFromMbox } from './gmail.js'
+import { analyzePerContactVoice, type PerContactVoiceProfile } from '../../analysis/voiceAnalyzer.js'
 
 type JsonObj = Record<string, unknown>
 
@@ -47,7 +48,21 @@ async function readCsvRows(filePath: string): Promise<Array<Record<string, strin
 
 function toIso(value: unknown): string | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
-    const ms = value > 10_000_000_000 ? value : value * 1000
+    // Handle different timestamp formats:
+    // - Seconds (< 1e10): multiply by 1000
+    // - Milliseconds (1e10 to 1e13): use as-is
+    // - Microseconds (> 1e13, typically ~1.7e15 for Chrome): divide by 1000
+    let ms: number
+    if (value > 1e15) {
+      // Microseconds (Chrome time_usec) - divide to get ms
+      ms = value / 1000
+    } else if (value > 10_000_000_000) {
+      // Already milliseconds
+      ms = value
+    } else {
+      // Seconds - multiply to get ms
+      ms = value * 1000
+    }
     const d = new Date(ms)
     return Number.isFinite(d.getTime()) ? d.toISOString() : null
   }
@@ -256,6 +271,188 @@ function parseDiscoverJson(parsed: unknown): IdentityEvent[] {
   return events
 }
 
+// Spam/automated message detection patterns
+const SPAM_PATTERNS = [
+  /\bcode:\s*\d+/i, // "code: 123456"
+  /\bOTP\b/i,
+  /\bverification\s*code\b/i,
+  /\byour\s*code\s*is\b/i,
+  /\bsecurity\s*code\b/i,
+  /\bverify\s*your\b/i,
+  /\border\s*#\b/i,
+  /\byour\s*order\b/i,
+  /\bshipped\b/i,
+  /\bdelivered\b/i,
+  /\btracking\s*#\b/i,
+  /\bpackage\s*arriving\b/i,
+  /\bappointment\s*reminder\b/i,
+  /\bbalance\s*is\b/i,
+  /\btransaction\s*alert\b/i,
+  /\bfraud\s*alert\b/i,
+]
+
+const SHORT_CODE_REGEX = /^\+?1?(\d{5,6})$/ // 5-6 digit short codes
+
+function isLikelySpamMessage(text: string, senderName: string, phoneFromHref: string | null, messageCount: number): boolean {
+  // Empty sender name = likely spam
+  if (!senderName || senderName.trim() === '') return true
+
+  // Short code phone numbers
+  if (phoneFromHref) {
+    const digits = phoneFromHref.replace(/\D/g, '')
+    if (SHORT_CODE_REGEX.test(digits)) return true
+  }
+
+  // Single message thread with no sender name context
+  if (messageCount === 1 && senderName === 'Unknown') return true
+
+  // Content patterns
+  const lowerText = text.toLowerCase()
+  for (const pattern of SPAM_PATTERNS) {
+    if (pattern.test(lowerText)) return true
+  }
+
+  // Very short numeric-only messages (verification codes)
+  if (text.length < 20 && /^\d+$/.test(text.trim())) return true
+
+  return false
+}
+
+// Business/organization name patterns for bulk filtering
+const BUSINESS_PATTERNS = [
+  /\b(pharmacy|medical|clinic|hospital|health|wellness)\b/i,
+  /\b(bank|pnc|chase|wells|credit|union|loan)\b/i,
+  /\b(amazon|walmart|target|costco|best buy)\b/i,
+  /\b(uber|lyft|taxi|transit|delivery)\b/i,
+  /\b(postal|usps|fedex|ups|dhl)\b/i,
+  /\b(google|apple|microsoft|facebook|instagram)\b/i,
+  /\b(netflix|spotify|hulu|amazon prime)\b/i,
+  /\b(restaurant|food|delivery|doordash|grubhub)\b/i,
+  /\b(case manager|social security|unemployment|benefits)\b/i,
+  /\b(utility|con edison|national grid|verizon|att)\b/i,
+]
+
+// Known business contact names to exclude
+const BUSINESS_CONTACTS = new Set([
+  'Pharmacy Specs',
+  'Pnc',
+  'Snap Balance',
+  'Wellness Transit LLC',
+  'Sunset Medical Real',
+  'Queens Ledger',
+  'Sabiyha Case Manager',
+  'Unemployment filing#',
+  'Party Full',
+  'Plow Guy Mark Ct',
+  'Sunset Terrace Family Health Center at NYU Langone',
+])
+
+function isLikelyBusinessContact(contactName: string): boolean {
+  if (!contactName) return false
+  
+  // Check against known business contacts
+  if (BUSINESS_CONTACTS.has(contactName)) return true
+  
+  // Check for business patterns
+  const lowerName = contactName.toLowerCase()
+  for (const pattern of BUSINESS_PATTERNS) {
+    if (pattern.test(lowerName)) return true
+  }
+  
+  // All-caps names are often businesses
+  if (contactName === contactName.toUpperCase() && contactName.length > 3) return true
+  
+  // Contains business keywords
+  if (/\b(llc|inc|corp|company|service|center|office)\b/i.test(contactName)) return true
+  
+  return false
+}
+
+function isConversationThread(messages: ParsedSmsMessage[]): boolean {
+  if (messages.length < 3) return false // Need at least 3 messages
+  
+  const userMessages = messages.filter(m => m.isUserMessage)
+  const contactMessages = messages.filter(m => !m.isUserMessage)
+  
+  // Need back-and-forth (at least 2 from each)
+  return userMessages.length >= 2 && contactMessages.length >= 2
+}
+
+interface ParsedSmsMessage {
+  timestamp: string | null
+  senderName: string
+  senderPhone: string | null
+  text: string
+  isUserMessage: boolean
+}
+
+function parseGoogleVoiceSmsHtml(rawHtml: string): { messages: ParsedSmsMessage[]; contactName: string | null } {
+  const messages: ParsedSmsMessage[] = []
+  let contactName: string | null = null
+
+  // Extract contact name from <title>
+  const titleMatch = rawHtml.match(/<title>([^<]*)<\/title>/i)
+  if (titleMatch && titleMatch[1].trim()) {
+    contactName = decodeHtmlEntities(titleMatch[1].trim())
+  }
+
+  // Parse each message div
+  const messageRe = /<div[^>]*class="message"[^>]*>([\s\S]*?)<\/div>\s*(?=<div|<\/div>|$)/gi
+  const messageBlocks = Array.from(rawHtml.matchAll(messageRe))
+
+  for (const block of messageBlocks) {
+    const blockHtml = block[1]
+
+    // Extract timestamp from <abbr class="dt" title="...">
+    const timestampMatch = blockHtml.match(/<abbr[^>]*class="dt"[^>]*title="([^"]+)"/i)
+    const timestamp = timestampMatch ? timestampMatch[1] : null
+
+    // Extract sender name and phone
+    const senderMatch = blockHtml.match(/<cite[^>]*class="sender[^"]*"[^>]*>([\s\S]*?)<\/cite>/i)
+    let senderName = 'Unknown'
+    let senderPhone: string | null = null
+    let isUserMessage = false
+
+    if (senderMatch) {
+      const senderHtml = senderMatch[1]
+
+      // Check for "Me" sender (user's own message)
+      if (/<abbr[^>]*class="fn"[^>]*>\s*Me\s*<\/abbr>/i.test(senderHtml)) {
+        senderName = 'Me'
+        isUserMessage = true
+      } else {
+        // Extract name from <span class="fn">
+        const fnMatch = senderHtml.match(/<span[^>]*class="fn"[^>]*>([^<]*)<\/span>/i)
+        if (fnMatch && fnMatch[1].trim()) {
+          senderName = decodeHtmlEntities(fnMatch[1].trim())
+        }
+      }
+
+      // Extract phone from href="tel:..."
+      const phoneMatch = senderHtml.match(/href="tel:([^"]+)"/i)
+      if (phoneMatch) {
+        senderPhone = phoneMatch[1]
+      }
+    }
+
+    // Extract message text from <q>...</q>
+    const textMatch = blockHtml.match(/<q>([\s\S]*?)<\/q>/i)
+    const text = textMatch ? decodeHtmlEntities(textMatch[1].replace(/<br\s*\/?>/gi, '\n')).trim() : ''
+
+    if (text) {
+      messages.push({
+        timestamp,
+        senderName,
+        senderPhone,
+        text,
+        isUserMessage,
+      })
+    }
+  }
+
+  return { messages, contactName }
+}
+
 function parseGoogleVoiceJson(parsed: unknown): IdentityEvent[] {
   const events: IdentityEvent[] = []
   const objs = flattenObjects(parsed)
@@ -264,6 +461,8 @@ function parseGoogleVoiceJson(parsed: unknown): IdentityEvent[] {
     const from = textFromKeys(obj, ['from', 'fromNumber', 'sender'])
     const to = textFromKeys(obj, ['to', 'toNumber', 'recipient'])
     const hasVoiceSignal = /voice|voicemail|call|sms|mms/i.test(Object.keys(obj).join(' '))
+    // Skip CSS/style garbage - detect by CSS-like content
+    if (text && (/\{\s*[^}]*:\s*[^;]*;/.test(text) || /Copyright.*Google.*Reserved/i.test(text))) continue
     if (!text && !hasVoiceSignal) continue
     const createdAt = toIso(obj.time) ?? toIso(obj.timestamp) ?? toIso(obj.date) ?? null
     pushEvent(events, {
@@ -383,9 +582,14 @@ export async function importDiscoverTakeoutFromFolder(folderPath: string): Promi
   return events
 }
 
-export async function importGoogleVoiceTakeoutFromFolder(folderPath: string): Promise<IdentityEvent[]> {
+export async function importGoogleVoiceTakeoutFromFolder(folderPath: string): Promise<{
+  events: IdentityEvent[]
+  contactProfiles: PerContactVoiceProfile[]
+}> {
   const files = await listFilesRecursive(folderPath)
   const events: IdentityEvent[] = []
+  const contactMessagesMap = new Map<string, Array<{ text: string; isUserMessage: boolean; timestamp: string | null; senderName: string }>>()
+  
   for (const file of files) {
     const lower = file.toLowerCase()
     if (lower.endsWith('.json') && (lower.includes('google voice') || lower.includes('voice'))) {
@@ -398,16 +602,77 @@ export async function importGoogleVoiceTakeoutFromFolder(folderPath: string): Pr
       events.push(...parseRowsToEvents(rows, 'google_voice', 'google_voice'))
       continue
     }
-    if (lower.endsWith('.html') && (lower.includes('voice') || lower.includes('sms') || lower.includes('calls'))) {
+    if (lower.endsWith('.html') && (lower.includes('voice') || lower.includes('sms') || lower.includes('calls') || lower.includes('text'))) {
       try {
         const raw = await readFile(file, 'utf8')
-        events.push(...parseTakeoutActivityHtml(raw, 'google_voice', 'google_voice'))
+        // Use specialized SMS parser for text messages
+        const { messages, contactName } = parseGoogleVoiceSmsHtml(raw)
+        
+        // Bulk filtering: skip entire contact if business
+        if (contactName && isLikelyBusinessContact(contactName)) {
+          continue
+        }
+        
+        // Quality filtering: only import conversation threads (back-and-forth)
+        if (!isConversationThread(messages)) {
+          continue
+        }
+        
+        // Collect messages for per-contact profile building
+        if (contactName) {
+          const existing = contactMessagesMap.get(contactName) ?? []
+          for (const msg of messages) {
+            existing.push({
+              text: msg.text,
+              isUserMessage: msg.isUserMessage,
+              timestamp: msg.timestamp,
+              senderName: msg.senderName,
+            })
+          }
+          contactMessagesMap.set(contactName, existing)
+        }
+        
+        // Process messages from valid conversations
+        for (const msg of messages) {
+          // Skip if this message is likely spam
+          if (isLikelySpamMessage(msg.text, msg.senderName, msg.senderPhone, messages.length)) {
+            continue
+          }
+          
+          const createdAt = msg.timestamp ? toIso(msg.timestamp) : null
+          pushEvent(events, {
+            source: 'sms',
+            kind: 'message',
+            text: msg.text,
+            createdAt,
+            participants: [msg.isUserMessage ? 'Me' : msg.senderName, contactName].filter((p): p is string => Boolean(p)),
+            channel: 'google_voice_sms',
+            externalId: null,
+            metadata: {
+              contactName,
+              senderName: msg.senderName,
+              senderPhone: msg.senderPhone,
+              isUserMessage: msg.isUserMessage,
+              isHuman: true,
+            },
+          })
+        }
       } catch {
         // ignore
       }
     }
   }
-  return events
+  
+  // Build per-contact profiles from collected messages
+  const contactProfiles: PerContactVoiceProfile[] = []
+  for (const [, msgs] of contactMessagesMap) {
+    const profile = analyzePerContactVoice(msgs)
+    if (profile) {
+      contactProfiles.push(profile)
+    }
+  }
+  
+  return { events, contactProfiles }
 }
 
 export async function importYouTubeTakeoutFromFolder(folderPath: string): Promise<IdentityEvent[]> {
@@ -467,8 +732,9 @@ async function importGmailTakeoutFromFolder(folderPath: string): Promise<Identit
 export async function importGoogleTakeoutAllFromFolder(folderPath: string): Promise<{
   events: IdentityEvent[]
   bySource: Record<string, number>
+  contactProfiles: PerContactVoiceProfile[]
 }> {
-  const [gmail, chrome, discover, googleVoice, youtube] = await Promise.all([
+  const [gmail, chrome, discover, googleVoiceResult, youtube] = await Promise.all([
     importGmailTakeoutFromFolder(folderPath),
     importChromeTakeoutFromFolder(folderPath),
     importDiscoverTakeoutFromFolder(folderPath),
@@ -476,16 +742,25 @@ export async function importGoogleTakeoutAllFromFolder(folderPath: string): Prom
     importYouTubeTakeoutFromFolder(folderPath),
   ])
 
+  const googleVoice = googleVoiceResult.events
+  const contactProfiles = googleVoiceResult.contactProfiles
+
+  // Count SMS events separately from voice
+  const smsEvents = googleVoice.filter(e => e.channel === 'google_voice_sms')
+  const voiceEvents = googleVoice.filter(e => e.channel !== 'google_voice_sms')
+
   const bySource: Record<string, number> = {
     gmail: gmail.length,
     chrome: chrome.length,
     discover: discover.length,
-    google_voice: googleVoice.length,
+    google_voice: voiceEvents.length,
+    sms: smsEvents.length,
     youtube: youtube.length,
   }
 
   return {
     events: [...gmail, ...chrome, ...discover, ...googleVoice, ...youtube],
     bySource,
+    contactProfiles,
   }
 }

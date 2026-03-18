@@ -1,6 +1,7 @@
 import type { RedditDataset, RedditImportProgress } from '../types/reddit.types.js'
 import { analyzeVoice, type VoiceProfile } from '../analysis/voiceAnalyzer.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
+import { loadIdentityTimeline } from './identityStore.js'
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   if (!Number.isFinite(ms) || ms <= 0) return promise
@@ -183,8 +184,53 @@ export async function trainVoiceWithGemini(
     .map((p) => ({ text: `${p.title ?? ''}\n${p.body ?? ''}`.trim(), score: p.score ?? 0 }))
     .filter((p) => p.text.length > 0)
 
+  // Load SMS and Instagram from identity timeline for voice training
+  const identityTimeline = await loadIdentityTimeline()
+  const identityEvents = identityTimeline?.events ?? []
+  
+  // SMS messages (user's outbound texts)
+  const smsMessages = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'sms' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
+    .filter(m => m.text.length > 0)
+  
+  // Instagram DMs (user's outbound messages)
+  const instagramMessages = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'instagram' && e.kind === 'message' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
+    .filter(m => m.text.length > 0)
+  
+  // Instagram comments (always user's own)
+  const instagramComments = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'instagram' && e.kind === 'comment'
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
+    .filter(m => m.text.length > 0)
+  
+  // LLM chat prompts (user's messages to ChatGPT, Claude, etc.)
+  const llmChatMessages = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'llm_chat' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
+    .filter(m => m.text.length > 0)
+
   const localBaseline = analyzeVoice({
-    comments: dataset.comments.map((c) => ({ body: c.body ?? '', score: c.score ?? undefined })),
+    comments: [
+      ...dataset.comments.map((c) => ({ body: c.body ?? '', score: c.score ?? undefined })),
+      // Include SMS as "comments" for analysis (they're short-form text)
+      ...smsMessages.map(m => ({ body: m.text, score: undefined })),
+      // Include Instagram DMs and comments
+      ...instagramMessages.map(m => ({ body: m.text, score: undefined })),
+      ...instagramComments.map(m => ({ body: m.text, score: undefined })),
+      // Include LLM chat prompts
+      ...llmChatMessages.map(m => ({ body: m.text, score: undefined })),
+    ],
     posts: dataset.posts.map((p) => ({
       title: p.title ?? '',
       body: p.body ?? '',
@@ -198,7 +244,7 @@ export async function trainVoiceWithGemini(
   }
 
   // Use all data, but order so we get high-signal chunks first.
-  const all = [...comments, ...posts]
+  const all = [...comments, ...posts, ...smsMessages, ...instagramMessages, ...instagramComments, ...llmChatMessages]
     .filter((x) => x.text.length >= minTextLen)
     .sort((a, b) => (b.text.length + b.score) - (a.text.length + a.score))
     .slice(0, maxItems)
@@ -451,6 +497,14 @@ ${JSON.stringify({
   profile.closingPhrases = localBaseline.closingPhrases
   profile.representativeExamples = localBaseline.representativeExamples
   profile.highEngagementExamples = localBaseline.highEngagementExamples
+
+  // Record training metadata
+  profile.trainedAt = new Date().toISOString()
+  profile.trainingSources = {
+    redditComments: dataset.comments.length,
+    redditPosts: dataset.posts.length,
+    smsMessages: smsMessages.length,
+  }
 
   return profile
 }

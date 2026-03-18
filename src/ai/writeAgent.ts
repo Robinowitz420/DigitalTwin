@@ -1,4 +1,4 @@
-import type { VoiceProfile } from '../analysis/voiceAnalyzer.js'
+import type { VoiceProfile, PerContactVoiceProfile } from '../analysis/voiceAnalyzer.js'
 import type { IdentityLearningProfile } from '../types/identityLearning.types.js'
 import type { WriteAgentPreset, WriteAgentSliders } from '../types/writeAgent.types.js'
 
@@ -62,8 +62,21 @@ type BuildPromptInput = {
   sliders: WriteAgentSliders
   voiceProfile: VoiceProfile
   examples: string[]
+  styleEnvelope?: {
+    avgWords: number
+    medianWords: number
+    targetWords: number
+    maxWords: number
+    questionRate: number
+    exclaimRate: number
+    ellipsesRate: number
+    lowercaseStartRate: number
+    emojiRate: number
+    punctuationPerMsg: number
+  }
   identityProfile?: IdentityLearningProfile | null
   crossPlatformSamples?: string[]
+  contactProfile?: PerContactVoiceProfile | null
 }
 
 export function buildWriteLikeMePrompt(input: BuildPromptInput) {
@@ -94,33 +107,102 @@ export function buildWriteLikeMePrompt(input: BuildPromptInput) {
       ].join('\n')
     : 'No cross-platform identity profile available yet.'
 
-  return `You are writing as ${name} based on their Reddit writing plus cross-platform digital history.
+  // Dynamically determine style characteristics from the profile
+  const isShortStyle = vp.medianLength < 60
+  const isQuestionHeavy = vp.punctuationStyle.questionsPerComment > 0.3
+  const isCasual = vp.toneScores.casual > 0.6
+  const isFormal = vp.toneScores.formal > 0.5
+  const avgSentenceLength = vp.avgWordsPerSentence
 
-WRITING STYLE ANALYSIS:
+  const lengthGuidance = isShortStyle
+    ? `Target length: around ${Math.round(vp.medianLength)} words (typically 1-3 sentences). Keep it concise.`
+    : `Target length: around ${Math.round(vp.medianLength)} words. Match their typical comment length.`
+
+  const questionGuidance = isQuestionHeavy
+    ? `This user frequently asks questions. Use questions naturally where appropriate ("wait...", "what's that?", "why?", "how?", "is that...?").`
+    : `Use questions only when they naturally fit the topic.`
+
+  const toneGuidance = isCasual
+    ? `Write in a casual, conversational tone. Use contractions, casual language, and direct phrasing.`
+    : isFormal
+      ? `Write in a more polished, structured tone. Use complete sentences and clear organization.`
+      : `Match the tone shown in the examples below - balanced between casual and formal.`
+
+  const neverUsePhrases = [
+    'You know',
+    'I mean',
+    'Honestly',
+    'Look',
+    'To be fair',
+    'At the end of the day',
+    'I just wanted to',
+  ]
+    .map((p) => `- "${p}"`)
+    .join('\n')
+
+  const se = input.styleEnvelope
+  const styleEnvelopeBlock = se
+    ? `
+STYLE ENVELOPE (measured from the user's SMS samples selected for THIS request):
+- Avg words/message: ${se.avgWords}
+- Median words/message: ${se.medianWords}
+- Target length: ~${se.targetWords} words
+- Hard max length: ${se.maxWords} words
+- Emoji usage rate: ${se.emojiRate} (0..1)
+- Lowercase-start rate: ${se.lowercaseStartRate} (0..1)
+- Punctuation density: ${se.punctuationPerMsg} punctuation marks/message
+- Questions end-rate: ${se.questionRate} (0..1)
+- Exclamation usage rate: ${se.exclaimRate} (0..1)
+- Ellipses usage rate: ${se.ellipsesRate} (0..1)
+`
+    : ''
+
+  // Build contact-specific context if available
+  const cp = input.contactProfile
+  const contactContext = cp ? `
+CONTACT-SPECIFIC STYLE (talking to ${cp.contactName}):
+- Relationship: ${cp.relationshipType.replace('_', ' ')} (intimacy: ${Math.round(cp.intimacyScore * 100)}%)
+- Your style with them: avg ${Math.round(cp.userStyle.avgMessageLength)} chars, ${cp.userStyle.emojiUsageRate.toFixed(2)} emojis/msg, ${cp.userStyle.slangUsageRate.toFixed(2)} slang/msg
+- Their style: avg ${Math.round(cp.contactStyle.avgMessageLength)} chars, ${cp.contactStyle.emojiUsageRate.toFixed(2)} emojis/msg
+- Shared phrases: ${cp.sharedPhrases.slice(0, 8).join(', ') || '(none)'}
+- Total messages: ${cp.totalMessages} (${cp.userMessages} from you, ${cp.contactMessages} from them)
+
+SAMPLES OF YOUR MESSAGES TO ${cp.contactName.toUpperCase()}:
+${cp.representativeUserMessages.slice(0, 5).map((m, i) => `${i + 1}. "${m}"`).join('\n') || '(none)'}
+
+SAMPLES OF THEIR MESSAGES (for context):
+${cp.representativeContactMessages.slice(0, 3).map((m, i) => `${i + 1}. "${m}"`).join('\n') || '(none)'}
+` : ''
+
+  return `You are writing as ${name} based on their complete digital writing history (Reddit, Gmail, Chrome, YouTube, Google Voice, Discover, and other platforms).
+${contactContext}
+WRITING STYLE ANALYSIS (from their actual writing):
 - Average comment length: ${Math.round(vp.avgLength)} words
 - Median comment length: ${Math.round(vp.medianLength)} words
 - Vocabulary level: ${vp.vocabularyLevel}
 - Tone scores (0-1): ${toneSummary}
-- Average words per sentence: ${vp.avgWordsPerSentence.toFixed(1)}
+- Average words per sentence: ${avgSentenceLength.toFixed(1)}
 - Complex sentence ratio: ${vp.complexSentenceRatio.toFixed(2)}
 - Punctuation habits: exclamations/comment ${vp.punctuationStyle.exclamationsPerComment.toFixed(2)}, questions/comment ${vp.punctuationStyle.questionsPerComment.toFixed(2)}, ellipses/comment ${vp.punctuationStyle.ellipsesPerComment.toFixed(2)}, em-dashes/comment ${vp.punctuationStyle.emDashesPerComment.toFixed(2)}
 
-MOST FREQUENT PHRASES:
+MOST FREQUENT PHRASES (use these naturally when they fit):
 ${phrases}
 
-MOST FREQUENT WORDS/TERMS:
+MOST FREQUENT WORDS/TERMS (use these naturally when they fit):
 ${signatures}
 
-STARTER PHRASES:
+STARTER PHRASES (how they typically begin):
 ${starters}
 
-CLOSING PHRASES:
+CLOSING PHRASES (how they typically end):
 ${closers}
 
-EXAMPLES OF THEIR ACTUAL WRITING:
+EXAMPLES OF THEIR ACTUAL WRITING (CRITICAL - study these closely and match their style):
 ${examples || '(none)'}
 
-CROSS-PLATFORM IDENTITY PROFILE (Gmail/Chrome/YouTube/Voice/Discover/etc):
+${styleEnvelopeBlock}
+
+CROSS-PLATFORM IDENTITY PROFILE (learned from Gmail/Chrome/YouTube/Voice/Discover/etc):
 ${identitySummary}
 
 RELEVANT CROSS-PLATFORM SIGNALS FOR THIS TOPIC:
@@ -138,15 +220,22 @@ TASK:
 Write a response about: ${input.topic}
 
 RULES:
-- Execute the request directly. If the user asks for a poem, output only the poem. If they ask for an email, output only the email.
-- Do not comment on the request itself. No preface, critique, pep talk, or "my take" style framing.
-- Start immediately with the requested content.
-- Output only the drafted response, no analysis labels.
-- Match the user voice first, then apply slider adjustments.
-- Blend in cross-platform identity signals (interests, terms, channels) where relevant, without inventing facts.
-- Prioritize lexical and phrase similarity to the examples and frequent words/phrases above.
-- Keep factual claims modest unless the topic itself demands certainty.
-- Avoid repeating the same phrase unnaturally.
+- Match the user's actual writing style shown in the examples above. Study their length, tone, sentence structure, and phrasing patterns.
+- ${lengthGuidance}
+- ${questionGuidance}
+- ${toneGuidance}
+- Use their frequent phrases and words naturally when they fit the context.
+- Match their punctuation habits (exclamations, questions, ellipses, etc.) based on the metrics above.
+- Apply the personality slider adjustments while staying true to their core voice.
+- Hard constraints:
+  - NEVER use these phrases (Gemini filler tics):
+${neverUsePhrases}
+  - Do NOT add connective tissue filler ("you know", "I mean", etc.). If the transition isn't present in the examples, keep it abrupt.
+  - Do NOT "clean up" the writing. Prefer slightly messy, natural phrasing if the examples are messy.
+  - Do NOT over-explain. If the examples are short, keep it short.
+  - If STYLE ENVELOPE is present, obey its max length and match its casing/punctuation/emoji frequency.
+- Write ONLY the response itself. No meta-commentary, no explanations, no "Hey everyone" intros unless that's how they actually write.
+- If the examples show they write short comments, write short. If they write longer explanations, write longer. Match what you see in the examples.
 
 Write in their authentic voice, adjusted for the personality settings above.`
 }

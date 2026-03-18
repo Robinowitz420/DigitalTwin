@@ -12,5 +12,5 @@
     "sourceMap": true
   },
   "include": ["src/main/**/*.ts", "src/ai/**/*.ts", "src/utils/**/*.ts", "src/types/**/*.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "src/**/__tests__/**", "**/*.test.ts", "**/*.spec.ts"]
 }
