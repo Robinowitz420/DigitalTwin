@@ -2,6 +2,13 @@ import type { RedditDataset, RedditImportProgress } from '../types/reddit.types.
 import { analyzeVoice, type VoiceProfile } from '../analysis/voiceAnalyzer.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { loadIdentityTimeline } from './identityStore.js'
+import {
+  loadVoiceCheckpoint,
+  saveVoiceCheckpoint,
+  clearVoiceCheckpoint,
+  createInitialCheckpoint,
+} from './voiceCheckpointStore.js'
+import type { VoiceTrainingCheckpoint, VoiceTrainingControl } from '../types/voiceTraining.types.js'
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   if (!Number.isFinite(ms) || ms <= 0) return promise
@@ -98,6 +105,50 @@ type ChunkStyle = {
   dont: string[]
 }
 
+// Global training control state
+let trainingPaused = false
+let trainingAborted = false
+
+export function createTrainingControl(): VoiceTrainingControl {
+  trainingPaused = false
+  trainingAborted = false
+  return {
+    pause: () => { trainingPaused = true },
+    resume: () => { trainingPaused = false },
+    isPaused: () => trainingPaused,
+    abort: () => { trainingAborted = true },
+    isAborted: () => trainingAborted,
+  }
+}
+
+// Quality filter for training data - only include substantive content
+function isHighQualityText(text: string, minLen: number): boolean {
+  if (text.length < minLen) return false
+  // Skip very short or low-effort content
+  const words = text.split(/\s+/).length
+  if (words < 5) return false
+  // Skip content that's mostly URLs or mentions
+  const urlCount = (text.match(/https?:\/\//g) ?? []).length
+  if (urlCount > 3 && text.length < 200) return false
+  // Skip content that's mostly emojis
+  const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) ?? []).length
+  if (emojiCount > words / 3) return false
+  return true
+}
+
+// Score-based filtering - prioritize high-engagement content
+function scoreContent(item: { text: string; score: number }): number {
+  let score = 0
+  // Length bonus (optimal 50-500 chars)
+  if (item.text.length >= 50 && item.text.length <= 500) score += 10
+  else if (item.text.length >= 30) score += 5
+  // Engagement score bonus
+  score += Math.min(item.score / 10, 20) // Cap at 20 points
+  // Substantive content bonus
+  if (item.text.includes('.') || item.text.includes('?') || item.text.includes('!')) score += 5
+  return score
+}
+
 export async function trainVoiceWithGemini(
   dataset: RedditDataset,
   opts: {
@@ -112,6 +163,8 @@ export async function trainVoiceWithGemini(
       minTextLen?: number
       reduceTimeoutMs?: number
     }
+    resumeFromCheckpoint?: boolean
+    control?: VoiceTrainingControl
   },
 ): Promise<VoiceProfile> {
   const apiKey = process.env.GEMINI_API_KEY
@@ -127,12 +180,13 @@ export async function trainVoiceWithGemini(
   const timeoutEnv = Number(process.env.VOICE_TRAIN_TIMEOUT_MS)
   const reduceTimeoutEnv = Number(process.env.VOICE_TRAIN_REDUCE_TIMEOUT_MS)
   const testTimeoutEnv = Number(process.env.VOICE_TRAIN_TEST_TIMEOUT_MS)
+  const checkpointIntervalEnv = Number(process.env.VOICE_TRAIN_CHECKPOINT_INTERVAL)
 
   const chunkSizeDefault = 30
   const maxChunkCharsDefault = 16_000
   const maxItemCharsDefault = 900
-  const maxItemsDefault = Number.MAX_SAFE_INTEGER
-  const minTextLenDefault = 40
+  const maxItemsDefault = 5000 // Limit to prevent massive training sets
+  const minTextLenDefault = 50 // Higher threshold for quality
 
   const chunkSize =
     opts.tuning?.chunkSize ??
@@ -149,6 +203,9 @@ export async function trainVoiceWithGemini(
   const minTextLen =
     opts.tuning?.minTextLen ??
     (Number.isFinite(minTextLenEnv) && minTextLenEnv > 0 ? minTextLenEnv : minTextLenDefault)
+  const checkpointInterval = Number.isFinite(checkpointIntervalEnv) && checkpointIntervalEnv > 0 
+    ? checkpointIntervalEnv 
+    : 10 // Save checkpoint every 10 chunks
 
   const genAI = new GoogleGenerativeAI(apiKey)
   const model = genAI.getGenerativeModel({
@@ -178,11 +235,11 @@ export async function trainVoiceWithGemini(
 
   const comments = dataset.comments
     .map((c) => ({ text: (c.body ?? '').trim(), score: c.score ?? 0 }))
-    .filter((c) => c.text.length > 0)
+    .filter((c) => c.text.length > 0 && isHighQualityText(c.text, minTextLen))
 
   const posts = dataset.posts
     .map((p) => ({ text: `${p.title ?? ''}\n${p.body ?? ''}`.trim(), score: p.score ?? 0 }))
-    .filter((p) => p.text.length > 0)
+    .filter((p) => p.text.length > 0 && isHighQualityText(p.text, minTextLen))
 
   // Load SMS and Instagram from identity timeline for voice training
   const identityTimeline = await loadIdentityTimeline()
@@ -194,7 +251,7 @@ export async function trainVoiceWithGemini(
       e.source === 'sms' && e.metadata?.isUserMessage === true
     )
     .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
-    .filter(m => m.text.length > 0)
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
   
   // Instagram DMs (user's outbound messages)
   const instagramMessages = identityEvents
@@ -202,7 +259,7 @@ export async function trainVoiceWithGemini(
       e.source === 'instagram' && e.kind === 'message' && e.metadata?.isUserMessage === true
     )
     .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
-    .filter(m => m.text.length > 0)
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
   
   // Instagram comments (always user's own)
   const instagramComments = identityEvents
@@ -210,7 +267,7 @@ export async function trainVoiceWithGemini(
       e.source === 'instagram' && e.kind === 'comment'
     )
     .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
-    .filter(m => m.text.length > 0)
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
   
   // LLM chat prompts (user's messages to ChatGPT, Claude, etc.)
   const llmChatMessages = identityEvents
@@ -218,17 +275,14 @@ export async function trainVoiceWithGemini(
       e.source === 'llm_chat' && e.metadata?.isUserMessage === true
     )
     .map(e => ({ text: (e.text ?? '').trim(), score: 0 }))
-    .filter(m => m.text.length > 0)
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
 
   const localBaseline = analyzeVoice({
     comments: [
       ...dataset.comments.map((c) => ({ body: c.body ?? '', score: c.score ?? undefined })),
-      // Include SMS as "comments" for analysis (they're short-form text)
       ...smsMessages.map(m => ({ body: m.text, score: undefined })),
-      // Include Instagram DMs and comments
       ...instagramMessages.map(m => ({ body: m.text, score: undefined })),
       ...instagramComments.map(m => ({ body: m.text, score: undefined })),
-      // Include LLM chat prompts
       ...llmChatMessages.map(m => ({ body: m.text, score: undefined })),
     ],
     posts: dataset.posts.map((p) => ({
@@ -243,33 +297,77 @@ export async function trainVoiceWithGemini(
     return localBaseline
   }
 
-  // Use all data, but order so we get high-signal chunks first.
-  const all = [...comments, ...posts, ...smsMessages, ...instagramMessages, ...instagramComments, ...llmChatMessages]
-    .filter((x) => x.text.length >= minTextLen)
-    .sort((a, b) => (b.text.length + b.score) - (a.text.length + a.score))
+  // Score and filter content, prioritize high-quality
+  const allScored = [...comments, ...posts, ...smsMessages, ...instagramMessages, ...instagramComments, ...llmChatMessages]
+    .map(item => ({ ...item, qualityScore: scoreContent(item) }))
+    .sort((a, b) => b.qualityScore - a.qualityScore || b.score - a.score)
     .slice(0, maxItems)
 
   // Chunk by item count and prompt size to avoid slow / timed-out generations.
-  const chunks = chunkBySizeAndChars(all, chunkSize, maxChunkChars, maxItemChars)
+  const chunks = chunkBySizeAndChars(allScored, chunkSize, maxChunkChars, maxItemChars)
   console.log('[VoiceTrainer] Training set', {
-    totalItems: all.length,
+    totalItems: allScored.length,
     chunkSize,
     maxChunkChars,
     maxItemChars,
     chunks: chunks.length,
+    filtered: comments.length + posts.length + smsMessages.length + instagramMessages.length + instagramComments.length + llmChatMessages.length,
   })
 
   const total = Math.max(1, chunks.length)
-  const chunkSummaries: ChunkStyle[] = []
-  let blockedChunks = 0
-  let invalidJsonChunks = 0
-  let timeoutChunks = 0
 
-  if (chunks.length === 0) {
-    throw new Error('Not enough Reddit content to train a voice profile. Try importing more data or lowering filters.')
+  // Check for existing checkpoint to resume
+  let checkpoint: VoiceTrainingCheckpoint | null = null
+  if (opts.resumeFromCheckpoint) {
+    checkpoint = await loadVoiceCheckpoint()
+    if (checkpoint) {
+      console.log('[VoiceTrainer] Resuming from checkpoint', {
+        processedChunks: checkpoint.processedChunks,
+        totalChunks: checkpoint.totalChunks,
+      })
+    }
   }
 
-  for (let i = 0; i < chunks.length; i++) {
+  if (!checkpoint) {
+    checkpoint = createInitialCheckpoint(total, {
+      totalItems: allScored.length,
+      comments: comments.length,
+      posts: posts.length,
+      smsMessages: smsMessages.length,
+      instagramMessages: instagramMessages.length,
+      instagramComments: instagramComments.length,
+      llmChatMessages: llmChatMessages.length,
+    })
+  }
+
+  if (chunks.length === 0) {
+    throw new Error('Not enough quality content to train a voice profile. Try importing more data or lowering filters.')
+  }
+
+  const chunkSummaries: ChunkStyle[] = checkpoint.chunkSummaries ?? []
+  let blockedChunks = checkpoint.skippedChunks
+  let invalidJsonChunks = 0
+  let timeoutChunks = 0
+  const startIdx = checkpoint.processedChunks
+
+  for (let i = startIdx; i < chunks.length; i++) {
+    // Check for pause/abort
+    while (trainingPaused && !trainingAborted) {
+      await new Promise(r => setTimeout(r, 500))
+      opts.onProgress?.({
+        stage: 'training',
+        percent: 90 * (checkpoint!.processedChunks / total),
+        message: `Training paused at chunk ${checkpoint!.processedChunks}/${total}. Click Resume to continue.`,
+      })
+    }
+
+    if (trainingAborted) {
+      checkpoint.status = 'paused'
+      checkpoint.error = 'Training aborted by user'
+      await saveVoiceCheckpoint(checkpoint)
+      throw new Error('Training aborted by user')
+    }
+
     const percent = 90 * ((i + 1) / total)
     opts.onProgress?.({
       stage: 'training',
@@ -326,6 +424,13 @@ ${samples}`
           percent: Math.max(1, Math.min(90, percent)),
           message: `Skipping blocked sample (chunk ${i + 1}/${total})`,
         })
+        // Save checkpoint even on skip
+        checkpoint.processedChunks = i + 1
+        checkpoint.skippedChunks = blockedChunks
+        checkpoint.lastCheckpointAt = new Date().toISOString()
+        if ((i + 1) % checkpointInterval === 0) {
+          await saveVoiceCheckpoint(checkpoint)
+        }
         continue
       }
       if (isTimeoutError(details)) {
@@ -354,6 +459,12 @@ ${samples}`
               percent: Math.max(1, Math.min(90, percent)),
               message: `Skipping blocked retry (chunk ${i + 1}/${total})`,
             })
+            checkpoint.processedChunks = i + 1
+            checkpoint.skippedChunks = blockedChunks
+            checkpoint.lastCheckpointAt = new Date().toISOString()
+            if ((i + 1) % checkpointInterval === 0) {
+              await saveVoiceCheckpoint(checkpoint)
+            }
             continue
           }
           if (isTimeoutError(retryDetails)) {
@@ -368,12 +479,26 @@ ${samples}`
               percent: Math.max(1, Math.min(90, percent)),
               message: `Skipping slow chunk ${i + 1}/${total} after retry timeout`,
             })
+            checkpoint.processedChunks = i + 1
+            checkpoint.skippedChunks = blockedChunks
+            checkpoint.lastCheckpointAt = new Date().toISOString()
+            if ((i + 1) % checkpointInterval === 0) {
+              await saveVoiceCheckpoint(checkpoint)
+            }
             continue
           }
-          throw new Error(`Gemini generate failed (chunk ${i + 1}/${total} retry): ${retryDetails}`)
+          // Save checkpoint on error
+          checkpoint.status = 'paused'
+          checkpoint.error = `Gemini generate failed (chunk ${i + 1}/${total} retry): ${retryDetails}`
+          await saveVoiceCheckpoint(checkpoint)
+          throw new Error(checkpoint.error)
         }
       } else {
-        throw new Error(`Gemini generate failed (chunk ${i + 1}/${total}): ${details}`)
+        // Save checkpoint on error
+        checkpoint.status = 'paused'
+        checkpoint.error = `Gemini generate failed (chunk ${i + 1}/${total}): ${details}`
+        await saveVoiceCheckpoint(checkpoint)
+        throw new Error(checkpoint.error)
       }
     }
 
@@ -399,6 +524,22 @@ ${samples}`
     }
 
     chunkSummaries.push(parsed)
+    
+    // Update checkpoint
+    checkpoint.processedChunks = i + 1
+    checkpoint.chunkSummaries = chunkSummaries
+    checkpoint.lastCheckpointAt = new Date().toISOString()
+    
+    // Save checkpoint periodically
+    if ((i + 1) % checkpointInterval === 0) {
+      console.log('[VoiceTrainer] Saving checkpoint', { processedChunks: i + 1, total })
+      await saveVoiceCheckpoint(checkpoint)
+      opts.onProgress?.({
+        stage: 'training',
+        percent: Math.max(1, Math.min(90, percent)),
+        message: `Checkpoint saved (chunk ${i + 1}/${total})`,
+      })
+    }
   }
 
   if (chunkSummaries.length === 0) {
@@ -407,6 +548,7 @@ ${samples}`
       percent: 95,
       message: 'Using local fallback analyzer due to Gemini safety blocks…',
     })
+    await clearVoiceCheckpoint()
     return useLocalFallback('All chunks blocked/unavailable')
   }
 
@@ -442,7 +584,7 @@ ${JSON.stringify(chunkSummaries).slice(0, 120_000)}
 Also, compute approximate numeric fields based on the dataset stats provided below.
 Dataset stats:
 ${JSON.stringify({
-    totalTexts: all.length,
+    totalTexts: allScored.length,
     totalComments: comments.length,
   })}
 `
@@ -466,15 +608,21 @@ ${JSON.stringify({
         blockedChunks,
         usableChunks: chunkSummaries.length,
       })
+      await clearVoiceCheckpoint()
       return useLocalFallback('Reduce blocked by safety filter')
     }
-    throw new Error(`Gemini generate failed (reduce): ${details}`)
+    // Save checkpoint on reduce error
+    checkpoint.status = 'paused'
+    checkpoint.error = `Gemini generate failed (reduce): ${details}`
+    await saveVoiceCheckpoint(checkpoint)
+    throw new Error(checkpoint.error)
   }
 
   reduceRaw = reduceRaw.trim()
   const reduceJson = extractFirstJsonObject(reduceRaw) ?? reduceRaw
   const profile = safeJsonParse<VoiceProfile>(reduceJson)
   if (!profile) {
+    await clearVoiceCheckpoint()
     return useLocalFallback('Failed to parse Gemini reduce JSON')
   }
 
@@ -504,7 +652,13 @@ ${JSON.stringify({
     redditComments: dataset.comments.length,
     redditPosts: dataset.posts.length,
     smsMessages: smsMessages.length,
+    instagramMessages: instagramMessages.length,
+    instagramComments: instagramComments.length,
+    llmChatMessages: llmChatMessages.length,
   }
 
+  // Clear checkpoint on success
+  await clearVoiceCheckpoint()
+  
   return profile
 }

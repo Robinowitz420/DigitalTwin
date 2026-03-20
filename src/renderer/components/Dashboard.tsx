@@ -10,6 +10,7 @@ import {
 } from 'recharts'
 import type { RedditDataset } from '../../types/reddit.types'
 import ImportFlow from './ImportFlow'
+import IdentityInsightsGrid from './IdentityInsightsGrid'
 
 type Stat = { label: string; value: string }
 
@@ -140,6 +141,9 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Identity Insights */}
+      <IdentityInsightsGrid />
     </div>
   )
 }

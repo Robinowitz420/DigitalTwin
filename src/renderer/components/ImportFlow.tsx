@@ -16,6 +16,8 @@ export default function ImportFlow({ onImported }: Props) {
   const [progress, setProgress] = useState<RedditImportProgress | null>(null)
   const [busy, setBusy] = useState(false)
   const [training, setTraining] = useState(false)
+  const [trainingPaused, setTrainingPaused] = useState(false)
+  const [hasCheckpoint, setHasCheckpoint] = useState(false)
   const [trainProgress, setTrainProgress] = useState<RedditImportProgress | null>(null)
   const [trainLog, setTrainLog] = useState<string[]>([])
   const [learnBusy, setLearnBusy] = useState(false)
@@ -67,6 +69,12 @@ export default function ImportFlow({ onImported }: Props) {
   useEffect(() => {
     const off = window.digitalTwin?.onVoiceTrainProgress?.((p) => {
       setTrainProgress(p)
+      // Check if training was paused (percent -1 or message contains "paused")
+      if (p.percent === -1 || (p.message?.toLowerCase().includes('paused') ?? false)) {
+        setTrainingPaused(true)
+      } else {
+        setTrainingPaused(false)
+      }
       const msg = typeof p.message === 'string' ? p.message : null
       if (msg) {
         setTrainLog((lines) => {
@@ -82,9 +90,10 @@ export default function ImportFlow({ onImported }: Props) {
     let cancelled = false
     void (async () => {
       try {
-        const [latest, voiceProfile] = await Promise.all([
+        const [latest, voiceProfile, checkpointExists] = await Promise.all([
           window.digitalTwin.loadLatestRedditDataset(),
           window.digitalTwin.loadVoiceProfile(),
+          window.digitalTwin.hasVoiceTrainingCheckpoint?.() ?? Promise.resolve(false),
         ])
         if (cancelled) return
         if (latest) {
@@ -92,6 +101,7 @@ export default function ImportFlow({ onImported }: Props) {
           onImported(latest)
         }
         setHasVoiceProfile(voiceProfile != null)
+        setHasCheckpoint(checkpointExists)
         if (voiceProfile && typeof voiceProfile === 'object') {
           const vp = voiceProfile as { trainedAt?: string; trainingSources?: { redditComments: number; redditPosts: number; smsMessages: number } }
           setVoiceProfileData({
@@ -139,14 +149,16 @@ export default function ImportFlow({ onImported }: Props) {
     setFolderPath(selected)
   }
 
-  async function runTraining() {
+  async function runTraining(resume = false) {
     setError(null)
     setTraining(true)
-    setTrainProgress({ stage: 'training', percent: 0, message: 'Starting…' })
+    setTrainingPaused(false)
+    setTrainProgress({ stage: 'training', percent: resume ? -1 : 0, message: resume ? 'Resuming from checkpoint…' : 'Starting…' })
     setTrainLog([])
     try {
-      await window.digitalTwin.trainVoiceProfile()
+      await window.digitalTwin.trainVoiceProfile(resume)
       setHasVoiceProfile(true)
+      setHasCheckpoint(false)
       // Reload voice profile to get training metadata
       const vp = await window.digitalTwin.loadVoiceProfile()
       if (vp && typeof vp === 'object') {
@@ -158,8 +170,39 @@ export default function ImportFlow({ onImported }: Props) {
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Training failed')
+      // Check if there's still a checkpoint (meaning it was saved)
+      const checkpointExists = await window.digitalTwin.hasVoiceTrainingCheckpoint?.() ?? false
+      setHasCheckpoint(checkpointExists)
     } finally {
       setTraining(false)
+    }
+  }
+
+  async function pauseTraining() {
+    try {
+      await window.digitalTwin.pauseVoiceTraining?.()
+      setTrainingPaused(true)
+    } catch {
+      // ignore
+    }
+  }
+
+  async function resumeTraining() {
+    try {
+      await window.digitalTwin.resumeVoiceTraining?.()
+      setTrainingPaused(false)
+    } catch {
+      // ignore
+    }
+  }
+
+  async function abortTraining() {
+    try {
+      await window.digitalTwin.abortVoiceTraining?.()
+      setTraining(false)
+      setTrainingPaused(false)
+    } catch {
+      // ignore
     }
   }
 
@@ -475,34 +518,10 @@ export default function ImportFlow({ onImported }: Props) {
       }}
     >
       <div className="rounded-xl border border-white/10 bg-white/5 p-6">
-        <h2 className="text-lg font-semibold text-white">Import Reddit Export</h2>
+        <h2 className="text-lg font-semibold text-white">Train Your Digital Twin</h2>
         <p className="mt-2 text-sm text-white/70">
-          {hasDataset
-            ? 'Local Reddit data is already saved. You only need to re-import if you want to refresh it.'
-            : 'Drag & drop your export folder, or choose it manually.'}
+          Import data from the portals below, then train your voice and identity profiles.
         </p>
-
-        {(hasDataset || hasVoiceProfile) && (
-          <div className="mt-4 rounded-lg border border-emerald-400/20 bg-emerald-500/10 p-3 text-xs text-emerald-100/90">
-            <div className="font-medium text-white mb-2">Data Status</div>
-            <div className="grid gap-1">
-              <div className="flex justify-between">
-                <span>Reddit dataset:</span>
-                <span className="text-white">{hasDataset ? 'imported' : 'missing'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Voice profile:</span>
-                <span className="text-white">{hasVoiceProfile ? 'trained' : 'not built'}</span>
-              </div>
-              {voiceProfileData?.trainedAt && (
-                <div className="flex justify-between text-white/60">
-                  <span>Last trained:</span>
-                  <span>{new Date(voiceProfileData.trainedAt).toLocaleDateString()}</span>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
 
         {/* Data Assimilation Visualization */}
         {(Object.keys(sourceCounts).length > 0 || voiceProfileData) && (
@@ -566,109 +585,94 @@ export default function ImportFlow({ onImported }: Props) {
           </div>
         )}
 
-        <div className="mt-4 rounded-lg border border-white/10 bg-black/20 p-3">
-          <div className="text-xs font-medium text-white/80">Quick start</div>
-          <div className="mt-1 text-xs text-white/60">
-            1) Export your Reddit data.
-            2) Import the folder here.
-            3) Explore Who Am I, Time Machine, and Write Like Me.
-          </div>
-
-          {progressText && (
-            <div className="mt-3">
-              <div className="text-xs text-white/70">Progress: {progressText}</div>
-              <div className="mt-2 h-2 w-full overflow-hidden rounded bg-white/10">
-                <div
-                  className="h-full bg-indigo-500/80 transition-[width] duration-300"
-                  style={{ width: `${Math.max(0, Math.min(100, progress?.percent ?? 0))}%` }}
-                />
-              </div>
-            </div>
-          )}
-          {error && <div className="mt-3 text-xs text-red-300">{error}</div>}
-        </div>
-
-        <div className="mt-4">
-          {!hasDataset && (
-            <div className="flex flex-col gap-2">
-              <button
-                className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
-                onClick={chooseFolder}
-                disabled={busy}
-              >
-                Choose folder
-              </button>
-              <button
-                className="rounded-lg bg-indigo-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-500 transition-colors disabled:opacity-50"
-                onClick={runImport}
-                disabled={busy || !folderPath}
-              >
-                {busy ? 'Importing…' : 'Import'}
-              </button>
-            </div>
-          )}
-          {hasDataset && (
-            <button
-              className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
-              onClick={() => setShowImportTools((v) => !v)}
-              disabled={busy || training}
-            >
-              {showImportTools ? 'Hide re-import tools' : 'Re-import from a new folder'}
-            </button>
-          )}
-          {hasDataset && showImportTools && (
-            <div className="mt-2 flex flex-col gap-2">
-              <button
-                className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
-                onClick={chooseFolder}
-                disabled={busy}
-              >
-                Choose folder
-              </button>
-              <button
-                className="rounded-lg bg-indigo-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-500 transition-colors disabled:opacity-50"
-                onClick={runImport}
-                disabled={busy || !folderPath}
-              >
-                {busy ? 'Importing…' : 'Import and rebuild profile'}
-              </button>
-            </div>
-          )}
-        </div>
-
+        
         <div className="mt-6 rounded-xl border border-white/10 bg-black/20 p-4">
           <div className="text-sm font-medium text-white">Build a Copy of Me</div>
           <div className="mt-1 text-xs text-white/60">
-            This runs a deep LLM training pass over your imported Reddit comments + posts.
+            This runs a deep LLM training pass over your imported data (Reddit, SMS, Instagram, LLM chats).
           </div>
           <div className="mt-1 text-xs text-white/50">
-            This is stored locally and persists across app restarts.
+            Training uses only high-quality content and saves checkpoints every 10 chunks.
           </div>
 
-          <div className="mt-3 flex items-center gap-2">
-            <button
-              className="rounded-lg bg-purple-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-purple-500 transition-colors disabled:opacity-50"
-              onClick={runTraining}
-              disabled={training || busy || !hasDataset}
-            >
-              {training ? 'Building…' : hasVoiceProfile ? 'Rebuild my copy' : 'Build a copy of me'}
-            </button>
-            {trainProgress?.message && <div className="text-xs text-white/60 truncate">{trainProgress.message}</div>}
+          {/* Checkpoint status */}
+          {hasCheckpoint && !training && (
+            <div className="mt-3 rounded-lg border border-amber-400/20 bg-amber-500/10 p-2 text-xs text-amber-100/90">
+              <div className="font-medium text-white mb-1">Incomplete Training Found</div>
+              <div>A previous training session was interrupted. You can resume from where it left off.</div>
+            </div>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {/* Start/Resume button */}
+            {!training && (
+              <>
+                {hasCheckpoint ? (
+                  <button
+                    className="rounded-lg bg-purple-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-purple-500 transition-colors disabled:opacity-50"
+                    onClick={() => runTraining(true)}
+                    disabled={busy || !hasDataset}
+                  >
+                    Resume training
+                  </button>
+                ) : (
+                  <button
+                    className="rounded-lg bg-purple-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-purple-500 transition-colors disabled:opacity-50"
+                    onClick={() => runTraining(false)}
+                    disabled={busy || !hasDataset}
+                  >
+                    {hasVoiceProfile ? 'Rebuild my copy' : 'Build a copy of me'}
+                  </button>
+                )}
+              </>
+            )}
+
+            {/* Pause/Resume/Abort buttons during training */}
+            {training && (
+              <>
+                {trainingPaused ? (
+                  <button
+                    className="rounded-lg bg-emerald-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500 transition-colors"
+                    onClick={resumeTraining}
+                  >
+                    Resume
+                  </button>
+                ) : (
+                  <button
+                    className="rounded-lg bg-amber-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-amber-500 transition-colors"
+                    onClick={pauseTraining}
+                  >
+                    Pause
+                  </button>
+                )}
+                <button
+                  className="rounded-lg bg-red-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-red-500 transition-colors"
+                  onClick={abortTraining}
+                >
+                  Abort
+                </button>
+              </>
+            )}
+
+            {trainProgress?.message && <div className="text-xs text-white/60 truncate max-w-xs">{trainProgress.message}</div>}
           </div>
 
           <div className="mt-3 text-xs text-white/50">
-            Uses all available imported comments and posts for maximum fidelity.
+            Prioritizes high-engagement content and substantive posts for quality.
           </div>
 
           {trainProgress && (
             <div className="mt-3">
-              <div className="text-xs text-white/70">
-                Training: {formatPercent(trainProgress.percent)}
-                {trainProgress.message ? ` — ${trainProgress.message}` : ''}
+              <div className="flex items-center justify-between text-xs text-white/70">
+                <span>
+                  Training: {formatPercent(Math.max(0, trainProgress.percent))}
+                  {trainProgress.message ? ` — ${trainProgress.message}` : ''}
+                </span>
+                {trainingPaused && <span className="text-amber-400">(Paused)</span>}
               </div>
               <div className="mt-2 h-2 w-full overflow-hidden rounded bg-white/10">
                 <div
-                  className="h-full bg-purple-500/80 transition-[width] duration-300"
+                  className={`h-full transition-[width] duration-300 ${trainingPaused ? 'bg-amber-500/80' : 'bg-purple-500/80'}`}
                   style={{ width: `${Math.max(0, Math.min(100, trainProgress?.percent ?? 0))}%` }}
                 />
               </div>
@@ -824,6 +828,38 @@ export default function ImportFlow({ onImported }: Props) {
           </div>
 
           <div className="mt-4 grid gap-3 md:grid-cols-2">
+            {/* Reddit Export */}
+            <div className="rounded-lg border border-white/10 bg-black/30 p-3">
+              <div className="flex items-center gap-2">
+                <div className="text-sm text-white">Reddit Export</div>
+                {hasDataset && (
+                  <span className="text-emerald-400 text-sm">✓</span>
+                )}
+              </div>
+              <div className="mt-1 text-xs text-white/50">
+                Imported records: {sourceCounts.reddit ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-white/40">
+                Comments, posts, saved, upvoted
+              </div>
+              <div className="mt-3 flex flex-col gap-2">
+                <button
+                  className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white hover:bg-white/15 transition-colors"
+                  onClick={chooseFolder}
+                  disabled={busy || portalBusy != null}
+                >
+                  Choose Reddit folder
+                </button>
+                <button
+                  className="rounded-lg bg-orange-500/90 px-3 py-2 text-sm font-medium text-white hover:bg-orange-500 transition-colors disabled:opacity-50"
+                  onClick={runImport}
+                  disabled={busy || !folderPath || portalBusy != null}
+                >
+                  {busy ? 'Importing…' : 'Import Reddit'}
+                </button>
+              </div>
+            </div>
+
             <div className="rounded-lg border border-white/10 bg-black/30 p-3">
               <div className="flex items-center gap-2">
                 <div className="text-sm text-white">Gmail (JSON)</div>

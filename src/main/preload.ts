@@ -43,7 +43,11 @@ export type DigitalTwinApi = {
   loadVoiceProfile: () => Promise<unknown | null>
   loadIdentityProfile: () => Promise<unknown | null>
   clearVoiceProfile: () => Promise<boolean>
-  trainVoiceProfile: () => Promise<unknown>
+  trainVoiceProfile: (resumeFromCheckpoint?: boolean) => Promise<unknown>
+  pauseVoiceTraining: () => Promise<boolean>
+  resumeVoiceTraining: () => Promise<boolean>
+  abortVoiceTraining: () => Promise<boolean>
+  hasVoiceTrainingCheckpoint: () => Promise<boolean>
   learnIdentityProfile: () => Promise<unknown>
   onVoiceTrainProgress: (cb: (progress: RedditImportProgress) => void) => () => void
   onIdentityLearnProgress: (cb: (progress: RedditImportProgress) => void) => () => void
@@ -101,7 +105,11 @@ const api: DigitalTwinApi = {
   loadVoiceProfile: () => ipcRenderer.invoke('voice:loadProfile'),
   loadIdentityProfile: () => ipcRenderer.invoke('identity:loadProfile'),
   clearVoiceProfile: () => ipcRenderer.invoke('voice:clearProfile'),
-  trainVoiceProfile: () => ipcRenderer.invoke('voice:trainProfile'),
+  trainVoiceProfile: (resumeFromCheckpoint = false) => ipcRenderer.invoke('voice:trainProfile', resumeFromCheckpoint),
+  pauseVoiceTraining: () => ipcRenderer.invoke('voice:pauseTraining'),
+  resumeVoiceTraining: () => ipcRenderer.invoke('voice:resumeTraining'),
+  abortVoiceTraining: () => ipcRenderer.invoke('voice:abortTraining'),
+  hasVoiceTrainingCheckpoint: () => ipcRenderer.invoke('voice:hasCheckpoint'),
   learnIdentityProfile: () => ipcRenderer.invoke('identity:learnProfile'),
   onVoiceTrainProgress: (cb) => {
     const handler = (_event: Electron.IpcRendererEvent, progress: RedditImportProgress) => cb(progress)

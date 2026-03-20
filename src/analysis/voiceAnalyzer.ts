@@ -43,6 +43,9 @@ export type VoiceProfile = {
     redditComments: number
     redditPosts: number
     smsMessages: number
+    instagramMessages: number
+    instagramComments: number
+    llmChatMessages: number
   }
 }
 

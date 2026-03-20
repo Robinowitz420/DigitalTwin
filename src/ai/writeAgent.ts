@@ -108,25 +108,75 @@ export function buildWriteLikeMePrompt(input: BuildPromptInput) {
     : 'No cross-platform identity profile available yet.'
 
   // Dynamically determine style characteristics from the profile
-  const isShortStyle = vp.medianLength < 60
   const isQuestionHeavy = vp.punctuationStyle.questionsPerComment > 0.3
   const isCasual = vp.toneScores.casual > 0.6
   const isFormal = vp.toneScores.formal > 0.5
   const avgSentenceLength = vp.avgWordsPerSentence
 
-  const lengthGuidance = isShortStyle
-    ? `Target length: around ${Math.round(vp.medianLength)} words (typically 1-3 sentences). Keep it concise.`
-    : `Target length: around ${Math.round(vp.medianLength)} words. Match their typical comment length.`
+  // Length should be driven primarily by the verbosity slider (the user intent),
+  // and only secondarily by historical median length.
+  // NOTE: sliders are 0-10 scale, so we normalize by dividing by 10.
+  const verbosity = (input.sliders.verbosity ?? 5) / 10
+  const medianWords = Math.max(12, Math.round(vp.medianLength || 0))
+  const styleEnvelopeTarget = input.styleEnvelope?.targetWords
+  const styleEnvelopeMax = input.styleEnvelope?.maxWords
+  
+  // Parse explicit length/tone requests from the topic
+  const topicLower = input.topic.toLowerCase()
+  const explicitLong = /\b(long|detailed|thorough|comprehensive|full|essay|letter|article|story|explanation|in-depth)\b/.test(topicLower)
+  const explicitShort = /\b(short|brief|concise|quick|one-liner|tweet)\b/.test(topicLower)
+  const explicitLength = explicitLong ? 'long' : explicitShort ? 'short' : null
+  
+  // Parse explicit tone from topic
+  const explicitFormal = /\b(formal|professional|business|official)\b/.test(topicLower)
+  const explicitCasual = /\b(casual|informal|relaxed|friendly|chill)\b/.test(topicLower)
+  const explicitTone = explicitFormal ? 'formal' : explicitCasual ? 'casual' : null
+  
+  // Determine effective verbosity - explicit length requests override slider
+  const effectiveVerbosity = explicitLength === 'long' ? 0.85 
+    : explicitLength === 'short' ? 0.15 
+    : verbosity
+  
+  const baselineTarget = Math.max(medianWords, styleEnvelopeTarget ?? 0)
+  const targetWords =
+    effectiveVerbosity >= 0.75
+      ? Math.max(baselineTarget, 220)
+      : effectiveVerbosity >= 0.5
+        ? Math.max(baselineTarget, 120)
+        : effectiveVerbosity >= 0.25
+          ? Math.max(Math.min(baselineTarget, 120), 60)
+          : Math.max(Math.min(baselineTarget, 80), 30)
+  const hardMaxWords =
+    styleEnvelopeMax != null
+      ? (effectiveVerbosity < 0.35 ? styleEnvelopeMax : Math.round(styleEnvelopeMax * 2.5))
+      : (effectiveVerbosity < 0.35 ? Math.round(targetWords * 1.15) : Math.round(targetWords * 2.5))
+
+  const lengthGuidance = (() => {
+    if (explicitLength === 'long' || effectiveVerbosity >= 0.75) {
+      return `Target length: ~${targetWords} words. Write a complete response with structure (multiple paragraphs if helpful). Hard max: ${hardMaxWords} words. The user explicitly requested a longer response.`
+    }
+    if (effectiveVerbosity >= 0.5) {
+      return `Target length: ~${targetWords} words. Aim for a few solid paragraphs. Hard max: ${hardMaxWords} words.`
+    }
+    if (effectiveVerbosity >= 0.25) {
+      return `Target length: ~${targetWords} words. Keep it readable and to the point. Hard max: ${hardMaxWords} words.`
+    }
+    return `Target length: ~${targetWords} words (often 1-3 sentences). Keep it concise. Hard max: ${hardMaxWords} words.`
+  })()
 
   const questionGuidance = isQuestionHeavy
     ? `This user frequently asks questions. Use questions naturally where appropriate ("wait...", "what's that?", "why?", "how?", "is that...?").`
     : `Use questions only when they naturally fit the topic.`
 
-  const toneGuidance = isCasual
-    ? `Write in a casual, conversational tone. Use contractions, casual language, and direct phrasing.`
-    : isFormal
-      ? `Write in a more polished, structured tone. Use complete sentences and clear organization.`
-      : `Match the tone shown in the examples below - balanced between casual and formal.`
+  const toneGuidance = explicitTone
+    ? explicitTone === 'formal'
+      ? `The user requested a FORMAL tone. Use polished, professional wording with clean structure.`
+      : `The user requested a CASUAL tone. Write in a relaxed, conversational style with contractions and informal phrasing.`
+    : isCasual
+      ? `Write in a casual, conversational tone. Use contractions, casual language, and direct phrasing.`
+      : isFormal
+        ? `Write in a more polished, structured tone. Use complete sentences and clear organization.`
+        : `Match the tone shown in the examples below - balanced between casual and formal.`
 
   const neverUsePhrases = [
     'You know',
@@ -147,7 +197,7 @@ STYLE ENVELOPE (measured from the user's SMS samples selected for THIS request):
 - Avg words/message: ${se.avgWords}
 - Median words/message: ${se.medianWords}
 - Target length: ~${se.targetWords} words
-- Hard max length: ${se.maxWords} words
+- Max length: ${se.maxWords} words (strict only when verbosity is low)
 - Emoji usage rate: ${se.emojiRate} (0..1)
 - Lowercase-start rate: ${se.lowercaseStartRate} (0..1)
 - Punctuation density: ${se.punctuationPerMsg} punctuation marks/message
@@ -219,23 +269,27 @@ PERSONALITY ADJUSTMENTS FOR THIS RESPONSE:
 TASK:
 Write a response about: ${input.topic}
 
+CRITICAL LENGTH REQUIREMENT:
+${lengthGuidance}
+This is a HARD REQUIREMENT, not a suggestion. If the user asked for a long response, you MUST write multiple paragraphs.
+
 RULES:
-- Match the user's actual writing style shown in the examples above. Study their length, tone, sentence structure, and phrasing patterns.
-- ${lengthGuidance}
-- ${questionGuidance}
+- Match the user's actual writing style shown in the examples above. Study their tone, sentence structure, and phrasing patterns.
 - ${toneGuidance}
+- ${questionGuidance}
 - Use their frequent phrases and words naturally when they fit the context.
 - Match their punctuation habits (exclamations, questions, ellipses, etc.) based on the metrics above.
 - Apply the personality slider adjustments while staying true to their core voice.
+- IMPORTANT: Length guidance above is MANDATORY. Do NOT write a short response when the user asked for a long one.
 - Hard constraints:
   - NEVER use these phrases (Gemini filler tics):
 ${neverUsePhrases}
   - Do NOT add connective tissue filler ("you know", "I mean", etc.). If the transition isn't present in the examples, keep it abrupt.
   - Do NOT "clean up" the writing. Prefer slightly messy, natural phrasing if the examples are messy.
-  - Do NOT over-explain. If the examples are short, keep it short.
-  - If STYLE ENVELOPE is present, obey its max length and match its casing/punctuation/emoji frequency.
+  - Do NOT over-explain ONLY WHEN the user asked for brevity. Otherwise, provide sufficient detail.
+  - If STYLE ENVELOPE is present, match its casing/punctuation/emoji frequency. Its max length is OVERRIDDEN by explicit length requests.
 - Write ONLY the response itself. No meta-commentary, no explanations, no "Hey everyone" intros unless that's how they actually write.
-- If the examples show they write short comments, write short. If they write longer explanations, write longer. Match what you see in the examples.
+- Match the EXAMPLES' style, but RESPECT the user's explicit length/tone request above all.
 
 Write in their authentic voice, adjusted for the personality settings above.`
 }

@@ -15,7 +15,8 @@ import type {
 import { loadVoiceProfile, clearVoiceProfile } from './voiceProfileStore.js'
 import { saveVoiceProfile } from './voiceProfileStore.js'
 import { getContactProfile } from './contactProfileStore.js'
-import { trainVoiceWithGemini } from './voiceTrainer.js'
+import { trainVoiceWithGemini, createTrainingControl } from './voiceTrainer.js'
+import { loadVoiceCheckpoint } from './voiceCheckpointStore.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { buildWriteLikeMePrompt } from '../ai/writeAgent.js'
 import { analyzeVoice, type VoiceProfile } from '../analysis/voiceAnalyzer.js'
@@ -1278,7 +1279,10 @@ function registerIpcHandlers() {
     return clearVoiceProfile()
   })
 
-  ipcMain.handle('voice:trainProfile', async () => {
+  // Training control state
+  let trainingControl: ReturnType<typeof createTrainingControl> | null = null
+
+  ipcMain.handle('voice:trainProfile', async (_, resumeFromCheckpoint = false) => {
     if (!mainWindow) throw new Error('Main window not ready')
 
     const datasetPath = path.join(app.getPath('userData'), 'reddit.normalized.json')
@@ -1303,8 +1307,8 @@ function registerIpcHandlers() {
 
     sendTrainProgress({
       stage: 'training',
-      percent: 0,
-      message: 'Starting voice training…',
+      percent: resumeFromCheckpoint ? -1 : 0, // -1 indicates resuming
+      message: resumeFromCheckpoint ? 'Resuming voice training from checkpoint…' : 'Starting voice training…',
     })
 
     const originalLog = console.log
@@ -1338,10 +1342,15 @@ function registerIpcHandlers() {
       originalError(...args)
     }
 
+    // Create training control
+    trainingControl = createTrainingControl()
+
     try {
       const profile = await trainVoiceWithGemini(dataset, {
         model: process.env.GEMINI_MODEL ?? 'gemini-2.5-flash',
         onProgress: (p) => sendTrainProgress(p),
+        resumeFromCheckpoint,
+        control: trainingControl,
       })
       await saveVoiceProfile(profile)
       sendTrainProgress({
@@ -1349,20 +1358,52 @@ function registerIpcHandlers() {
         percent: 100,
         message: 'Voice training complete.',
       })
+      trainingControl = null
       return profile
     } catch (e) {
       const details = e instanceof Error ? e.message : String(e)
       mainWindow.webContents.send('voice:trainProgress', {
         stage: 'training',
-        percent: 0,
-        message: `Training failed: ${details}`,
+        percent: lastTrainPercent,
+        message: `Training paused: ${details}`,
       })
+      trainingControl = null
       throw e
     } finally {
       console.log = originalLog
       console.warn = originalWarn
       console.error = originalError
     }
+  })
+
+  ipcMain.handle('voice:pauseTraining', () => {
+    if (trainingControl) {
+      trainingControl.pause()
+      return true
+    }
+    return false
+  })
+
+  ipcMain.handle('voice:resumeTraining', () => {
+    if (trainingControl) {
+      trainingControl.resume()
+      return true
+    }
+    return false
+  })
+
+  ipcMain.handle('voice:abortTraining', () => {
+    if (trainingControl) {
+      trainingControl.abort()
+      trainingControl = null
+      return true
+    }
+    return false
+  })
+
+  ipcMain.handle('voice:hasCheckpoint', async () => {
+    const checkpoint = await loadVoiceCheckpoint()
+    return checkpoint !== null
   })
 
   ipcMain.handle('identity:learnProfile', async () => {
@@ -1600,17 +1641,26 @@ function registerIpcHandlers() {
         // 3. Gmail samples (from timeline)
         const gmailSamples = pickTimelineExamplesBySource(identityTimeline, input.topic, ['gmail'], 50)
 
-        // 4. Context window budgeting based on mode priority
+        // 4. Apply source locks (exclude unchecked sources)
+        const locks = input.sourceLocks ?? {}
+        const filteredSms = locks.includeSms === false ? [] : smsRetrieval.messages
+        const filteredReddit = locks.includeReddit === false ? [] : redditRetrieval.snippets
+        const filteredGmail = locks.includeGmail === false ? [] : gmailSamples
+
+        // 5. Context window budgeting based on mode priority
         const budgeted = budgetContextWindow(
           mode,
-          smsRetrieval.messages,
-          redditRetrieval.snippets,
-          gmailSamples,
+          filteredSms,
+          filteredReddit,
+          filteredGmail,
           { maxTokens: 25000 }, // Leave room for prompt + response
         )
 
-        // 5. Compute style envelope from FULL retrieved SMS set (not just 8 samples)
-        const styleEnvelope = computeStyleEnvelopeFromSmsExamples(budgeted.sms)
+        // 6. Compute style envelope from FULL retrieved SMS set (not just 8 samples)
+        //    If SMS is locked out, don't compute a style envelope (use defaults from voice profile)
+        const styleEnvelope = budgeted.sms.length > 0 
+          ? computeStyleEnvelopeFromSmsExamples(budgeted.sms)
+          : null
 
         // 6. Combine for prompt (budgeted already respects mode priority)
         const examples = [
@@ -1639,7 +1689,7 @@ function registerIpcHandlers() {
             total: gmailSamples.length,
             budgeted: budgeted.gmail.length,
           },
-          styleEnvelope: {
+          styleEnvelope: styleEnvelope ? {
             avgWords: styleEnvelope.avgWords,
             medianWords: styleEnvelope.medianWords,
             targetWords: styleEnvelope.targetWords,
@@ -1647,7 +1697,7 @@ function registerIpcHandlers() {
             exclaimRate: styleEnvelope.exclaimRate,
             emojiRate: styleEnvelope.emojiRate,
             lowercaseStartRate: styleEnvelope.lowercaseStartRate,
-          },
+          } : null,
           totalExamples: examples.length,
           estimatedTokens: budgeted.estimatedTokens,
         })
@@ -1658,7 +1708,7 @@ function registerIpcHandlers() {
           sliders: effectiveSliders,
           voiceProfile,
           examples,
-          styleEnvelope,
+          styleEnvelope: styleEnvelope ?? undefined,
           identityProfile,
           crossPlatformSamples: [], // Replaced by full retrieval pipeline
           contactProfile, // Only loaded when contactName was specified
