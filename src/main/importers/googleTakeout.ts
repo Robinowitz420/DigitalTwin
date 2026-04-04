@@ -4,6 +4,13 @@ import Papa from 'papaparse'
 import type { IdentityEvent } from '../../types/identity.types.js'
 import { importGmailEventsFromJson, importGmailEventsFromMbox } from './gmail.js'
 import { analyzePerContactVoice, type PerContactVoiceProfile } from '../../analysis/voiceAnalyzer.js'
+import { saveContactProfile } from '../contactProfileStore.js'
+import { extractFactsFromConversation, isOllamaRunning } from '../memory/ollamaClient.js'
+import { 
+  loadKnowledgeStore, 
+  saveKnowledgeStore, 
+  upsertEntities,
+} from '../knowledgeStore.js'
 
 type JsonObj = Record<string, unknown>
 
@@ -669,7 +676,60 @@ export async function importGoogleVoiceTakeoutFromFolder(folderPath: string): Pr
     const profile = analyzePerContactVoice(msgs)
     if (profile) {
       contactProfiles.push(profile)
+      // Save to contact profile store for later retrieval
+      saveContactProfile(profile).catch(e => 
+        console.warn('[GoogleTakeout] Failed to save contact profile:', e)
+      )
     }
+  }
+  
+  // Extract facts from conversations using Ollama (free, local)
+  if (await isOllamaRunning()) {
+    try {
+      const knowledgeStore = await loadKnowledgeStore()
+      const existingEntities = knowledgeStore.entities.map(e => ({
+        canonicalName: e.canonicalName,
+        type: e.type,
+        aliases: e.aliases,
+      }))
+      
+      for (const [contactKey, msgs] of contactMessagesMap) {
+        // Build conversation text from messages
+        const conversationText = msgs
+          .slice(-50) // Last 50 messages per contact
+          .map(m => `[${m.timestamp ?? 'unknown'}] ${m.isUserMessage ? 'Me' : m.senderName}: ${m.text}`)
+          .join('\n')
+        
+        if (conversationText.length < 100) continue // Skip short conversations
+        
+        const facts = await extractFactsFromConversation({
+          conversationText,
+          sourceType: 'sms',
+          contactName: contactKey,
+          existingEntities,
+        })
+        
+        if (facts.length > 0) {
+          // Get date from most recent message
+          const lastMsg = msgs[msgs.length - 1]
+          const date = lastMsg?.timestamp ?? new Date().toISOString()
+          
+          await upsertEntities(knowledgeStore, facts, {
+            source: 'sms',
+            date,
+            context: conversationText.slice(0, 500),
+            contactName: contactKey,
+          })
+        }
+      }
+      
+      await saveKnowledgeStore(knowledgeStore)
+      console.log('[GoogleTakeout] Extracted facts from conversations using Ollama')
+    } catch (e) {
+      console.warn('[GoogleTakeout] Failed to extract facts:', e)
+    }
+  } else {
+    console.log('[GoogleTakeout] Ollama not running - skipping fact extraction')
   }
   
   return { events, contactProfiles }

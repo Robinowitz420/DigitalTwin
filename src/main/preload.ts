@@ -9,6 +9,7 @@ import type {
   SocialCsvMapping,
   SocialCsvPreview,
 } from '../types/identity.types.js'
+import type { PerContactVoiceProfile } from '../analysis/voiceAnalyzer.js'
 
 export type DigitalTwinApi = {
   selectRedditExportFolder: () => Promise<string | null>
@@ -70,6 +71,11 @@ export type DigitalTwinApi = {
   checkGeminiHealth: () => Promise<{ ok: boolean; message?: string; models?: string[] }>
   writeLikeMeStream: (input: WriteAgentRequest, onChunk: (chunk: string, text: string) => void) => Promise<WriteAgentResult>
   onRedditImportProgress: (cb: (progress: RedditImportProgress) => void) => () => void
+  getAllContacts: () => Promise<PerContactVoiceProfile[]>
+  getAllKnowledge: () => Promise<import('./knowledgeStore.js').KnowledgeEntity[]>
+  getKnowledgeByType: (type: string) => Promise<import('./knowledgeStore.js').KnowledgeEntity[]>
+  deleteKnowledge: (entityId: string) => Promise<{ success: boolean }>
+  clearKnowledge: () => Promise<{ success: boolean }>
 }
 
 const api: DigitalTwinApi = {
@@ -176,6 +182,11 @@ const api: DigitalTwinApi = {
     ipcRenderer.on('reddit:importProgress', handler)
     return () => ipcRenderer.removeListener('reddit:importProgress', handler)
   },
+  getAllContacts: () => ipcRenderer.invoke('contact:getAll'),
+  getAllKnowledge: () => ipcRenderer.invoke('knowledge:getAll'),
+  getKnowledgeByType: (type: string) => ipcRenderer.invoke('knowledge:getByType', type),
+  deleteKnowledge: (entityId: string) => ipcRenderer.invoke('knowledge:delete', entityId),
+  clearKnowledge: () => ipcRenderer.invoke('knowledge:clear'),
 }
 
 contextBridge.exposeInMainWorld('digitalTwin', api)

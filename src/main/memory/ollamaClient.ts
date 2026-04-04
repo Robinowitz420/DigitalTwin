@@ -19,6 +19,16 @@ import { formatChunkForLLM } from './processor.js'
 const OLLAMA_HOST = 'http://localhost:11434'
 const DEFAULT_MODEL = 'llama3.2' // or 'mistral', 'llama3', etc.
 
+// Extracted fact from a conversation
+export type ExtractedFact = {
+  type: 'person' | 'place' | 'event' | 'work' | 'health' | 'relationship' | 'hobby' | 'opinion' | 'possession' | 'education' | 'travel' | 'pet' | 'project'
+  canonicalName: string
+  aliases: string[]
+  attributes: Record<string, unknown>
+  confidence: number
+  relatedTo?: string[]
+}
+
 /**
  * Knowledge Delta - tracks what user disclosed to a contact
  * Status meanings:
@@ -381,4 +391,108 @@ If no clear topics, respond with: NO_TOPICS`
   } catch (error) {
     return { topics: [] }
   }
+}
+
+/**
+ * Extract structured facts from a conversation using Ollama (free, local)
+ */
+export async function extractFactsFromConversation(params: {
+  conversationText: string
+  sourceType: string
+  contactName?: string
+  existingEntities?: Array<{ canonicalName: string; type: string; aliases: string[] }>
+  model?: string
+}): Promise<ExtractedFact[]> {
+  const { conversationText, sourceType, contactName, existingEntities, model } = params
+
+  const existingContext = existingEntities?.length 
+    ? `\n\nKNOWN ENTITIES (link to these if mentioned):\n${existingEntities.map(e => `- ${e.canonicalName} (${e.type}): aliases [${e.aliases.join(', ')}]`).join('\n')}`
+    : ''
+
+  const prompt = `Extract structured facts from this ${sourceType} conversation${contactName ? ` with ${contactName}` : ''}.
+
+IMPORTANT RULES:
+1. Only extract EXPLICIT facts mentioned in the conversation.
+2. Do NOT invent or assume anything not clearly stated.
+3. Include context in attributes (when, where, why).
+4. Be generous with aliases - include "my sister", "Sarah", "sis", etc.
+5. Confidence: 1.0 = explicitly named and described, 0.5 = mentioned but unclear, 0.3 = inferred
+
+ENTITY TYPES: person, place, event, work, health, relationship, hobby, opinion, possession, education, travel, pet, project
+
+Format each entity as:
+ENTITY_START
+TYPE: [entity type]
+NAME: [canonical name - e.g., "Sarah" not "my sister"]
+ALIASES: [comma-separated list of all ways this entity is referred to]
+ATTRIBUTES: [key:value pairs relevant to the type, e.g., relationship:sister, date:March 2024]
+CONFIDENCE: [0.0 to 1.0]
+RELATED_TO: [names of other entities this relates to, or "none"]
+ENTITY_END
+${existingContext}
+
+CONVERSATION:
+${conversationText.slice(0, 10000)}
+
+If no clear entities, respond with: NO_ENTITIES`
+
+  try {
+    const response = await ollamaGenerate(prompt, model)
+
+    if (response.includes('NO_ENTITIES')) {
+      return []
+    }
+
+    const entities: ExtractedFact[] = []
+    const entityRegex = /ENTITY_START\s*TYPE:\s*(.+?)\s*NAME:\s*(.+?)\s*ALIASES:\s*(.+?)\s*ATTRIBUTES:\s*(.+?)\s*CONFIDENCE:\s*(.+?)\s*RELATED_TO:\s*(.+?)\s*ENTITY_END/gs
+
+    let match
+    while ((match = entityRegex.exec(response)) !== null) {
+      const type = match[1].trim() as ExtractedFact['type']
+      const canonicalName = match[2].trim()
+      const aliases = match[3].split(',').map(a => a.trim()).filter(Boolean)
+      
+      // Parse attributes
+      const attributes: Record<string, unknown> = {}
+      const attrStr = match[4].trim()
+      if (attrStr && attrStr !== 'none') {
+        for (const pair of attrStr.split(',')) {
+          const [key, val] = pair.split(':').map(s => s.trim())
+          if (key && val) {
+            attributes[key] = val
+          }
+        }
+      }
+
+      const confidence = parseFloat(match[5].trim()) || 0.5
+      const relatedTo = match[6].trim() !== 'none' 
+        ? match[6].split(',').map(r => r.trim()).filter(Boolean)
+        : undefined
+
+      // Validate type
+      const validTypes: ExtractedFact['type'][] = ['person', 'place', 'event', 'work', 'health', 'relationship', 'hobby', 'opinion', 'possession', 'education', 'travel', 'pet', 'project']
+      if (validTypes.includes(type)) {
+        entities.push({
+          type,
+          canonicalName,
+          aliases,
+          attributes,
+          confidence,
+          relatedTo,
+        })
+      }
+    }
+
+    return entities
+  } catch (error) {
+    console.warn('[Ollama] Failed to extract facts:', error)
+    return []
+  }
+}
+
+/**
+ * Check if Ollama is available for fact extraction
+ */
+export async function isOllamaAvailableForFacts(): Promise<boolean> {
+  return isOllamaRunning()
 }

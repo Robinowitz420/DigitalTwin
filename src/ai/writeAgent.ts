@@ -77,6 +77,8 @@ type BuildPromptInput = {
   identityProfile?: IdentityLearningProfile | null
   crossPlatformSamples?: string[]
   contactProfile?: PerContactVoiceProfile | null
+  conversationMemory?: string
+  knowledgeFacts?: string
 }
 
 export function buildWriteLikeMePrompt(input: BuildPromptInput) {
@@ -216,7 +218,16 @@ CONTACT-SPECIFIC STYLE (talking to ${cp.contactName}):
 - Their style: avg ${Math.round(cp.contactStyle.avgMessageLength)} chars, ${cp.contactStyle.emojiUsageRate.toFixed(2)} emojis/msg
 - Shared phrases: ${cp.sharedPhrases.slice(0, 8).join(', ') || '(none)'}
 - Total messages: ${cp.totalMessages} (${cp.userMessages} from you, ${cp.contactMessages} from them)
-
+${cp.graniteSummary ? `
+GRANITE ANALYSIS OF YOUR COMMUNICATION WITH ${cp.contactName.toUpperCase()}:
+- Relationship: ${cp.graniteSummary.relationshipNarrative}
+- Your style with them: ${cp.graniteSummary.userStyleNarrative}
+- Their style: ${cp.graniteSummary.contactStyleNarrative}
+- Inside jokes/shared phrases: ${cp.graniteSummary.sharedJokes.join(', ') || '(none)'}
+- Recurring topics: ${cp.graniteSummary.recurringTopics.join(', ') || '(none)'}
+- Tone patterns: ${cp.graniteSummary.tonePatterns.join(', ') || '(none)'}
+- Notable exchanges: ${cp.graniteSummary.notableExchanges.slice(0, 3).join(' | ') || '(none)'}
+` : ''}
 SAMPLES OF YOUR MESSAGES TO ${cp.contactName.toUpperCase()}:
 ${cp.representativeUserMessages.slice(0, 5).map((m, i) => `${i + 1}. "${m}"`).join('\n') || '(none)'}
 
@@ -258,7 +269,7 @@ ${identitySummary}
 RELEVANT CROSS-PLATFORM SIGNALS FOR THIS TOPIC:
 ${crossSamples || '(none)'}
 
-PERSONALITY ADJUSTMENTS FOR THIS RESPONSE:
+${input.conversationMemory ? input.conversationMemory + '\n' : ''}${input.knowledgeFacts ? input.knowledgeFacts + '\n\n' : ''}PERSONALITY ADJUSTMENTS FOR THIS RESPONSE:
 - Formality: ${sliderInstruction('formality', input.sliders.formality)}
 - Assertiveness: ${sliderInstruction('assertiveness', input.sliders.assertiveness)}
 - Verbosity: ${sliderInstruction('verbosity', input.sliders.verbosity)}
@@ -281,6 +292,7 @@ RULES:
 - Match their punctuation habits (exclamations, questions, ellipses, etc.) based on the metrics above.
 - Apply the personality slider adjustments while staying true to their core voice.
 - IMPORTANT: Length guidance above is MANDATORY. Do NOT write a short response when the user asked for a long one.
+- HONESTY REQUIREMENT: If you lack sufficient data to authentically match the user's voice for a specific contact or topic, include a brief note at the start like "[Note: I don't have enough messages with [contact name] to fully match your style with them. Using general voice instead.]" Be transparent about limitations.
 - Hard constraints:
   - NEVER use these phrases (Gemini filler tics):
 ${neverUsePhrases}

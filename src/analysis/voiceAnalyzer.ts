@@ -90,6 +90,17 @@ export type PerContactVoiceProfile = {
   // Sample messages for AI context
   representativeUserMessages: string[] // user's messages to this contact
   representativeContactMessages: string[] // contact's messages for context
+  
+  // Granite-generated narrative (optional, for rich context)
+  graniteSummary?: {
+    relationshipNarrative: string
+    userStyleNarrative: string
+    contactStyleNarrative: string
+    sharedJokes: string[]
+    recurringTopics: string[]
+    tonePatterns: string[]
+    notableExchanges: string[]
+  }
 }
 
 type AnalyzeVoiceInput = {

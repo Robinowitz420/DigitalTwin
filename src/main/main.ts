@@ -15,7 +15,7 @@ import type {
 import { loadVoiceProfile, clearVoiceProfile } from './voiceProfileStore.js'
 import { saveVoiceProfile } from './voiceProfileStore.js'
 import { getContactProfile } from './contactProfileStore.js'
-import { trainVoiceWithGemini, createTrainingControl } from './voiceTrainer.js'
+import { trainVoice, createTrainingControl } from './voiceTrainer.js'
 import { loadVoiceCheckpoint } from './voiceCheckpointStore.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { buildWriteLikeMePrompt } from '../ai/writeAgent.js'
@@ -1346,11 +1346,13 @@ function registerIpcHandlers() {
     trainingControl = createTrainingControl()
 
     try {
-      const profile = await trainVoiceWithGemini(dataset, {
-        model: process.env.GEMINI_MODEL ?? 'gemini-2.5-flash',
+      // Use unified trainVoice which picks Granite if available, else Gemini
+      const profile = await trainVoice(dataset, {
         onProgress: (p) => sendTrainProgress(p),
         resumeFromCheckpoint,
         control: trainingControl,
+        includeContactProfiles: true, // Build per-contact style profiles
+        preferGranite: true, // Use Granite if watsonx credentials are set
       })
       await saveVoiceProfile(profile)
       sendTrainProgress({
@@ -1404,6 +1406,38 @@ function registerIpcHandlers() {
   ipcMain.handle('voice:hasCheckpoint', async () => {
     const checkpoint = await loadVoiceCheckpoint()
     return checkpoint !== null
+  })
+
+  // Get all contact profiles for UI dropdown
+  ipcMain.handle('contact:getAll', async () => {
+    const { getAllContactProfiles } = await import('./contactProfileStore.js')
+    return getAllContactProfiles()
+  })
+
+  // Knowledge store handlers
+  ipcMain.handle('knowledge:getAll', async () => {
+    const { getAllEntities } = await import('./knowledgeStore.js')
+    return getAllEntities()
+  })
+
+  ipcMain.handle('knowledge:getByType', async (_event, type: string) => {
+    const { loadKnowledgeStore, findEntitiesByType } = await import('./knowledgeStore.js')
+    const store = await loadKnowledgeStore()
+    return findEntitiesByType(store, type as import('./knowledgeStore.js').EntityType)
+  })
+
+  ipcMain.handle('knowledge:delete', async (_event, entityId: string) => {
+    const { loadKnowledgeStore, saveKnowledgeStore, deleteEntity } = await import('./knowledgeStore.js')
+    const store = await loadKnowledgeStore()
+    await deleteEntity(store, entityId)
+    await saveKnowledgeStore(store)
+    return { success: true }
+  })
+
+  ipcMain.handle('knowledge:clear', async () => {
+    const { clearKnowledgeStore } = await import('./knowledgeStore.js')
+    await clearKnowledgeStore()
+    return { success: true }
   })
 
   ipcMain.handle('identity:learnProfile', async () => {
@@ -1596,9 +1630,17 @@ function registerIpcHandlers() {
           throw new Error('No Reddit dataset found. Import your Reddit export first.')
         }
 
-        // Lazy load contact profile ONLY when contactName is specified
-        const contactProfile = input.contactName 
-          ? await getContactProfile(input.contactName) 
+        // Extract contact name from topic if user mentions someone naturally
+        // e.g., "Write a letter to Kevin about my new job" -> extracts "Kevin"
+        const { extractContactFromQuery } = await import('./memory/retrieval.js')
+        const { getAllContactProfiles } = await import('./contactProfileStore.js')
+        const allContacts = await getAllContactProfiles()
+        const knownContactNames = allContacts.map(c => c.contactName)
+        const extractedContactName = input.contactName || extractContactFromQuery(input.topic, knownContactNames)
+        
+        // Load contact profile if a contact was mentioned
+        const contactProfile = extractedContactName 
+          ? await getContactProfile(extractedContactName) 
           : null
         const [identityProfile, identityTimeline] = await Promise.all([
           loadIdentityLearningProfile(),
@@ -1630,7 +1672,7 @@ function registerIpcHandlers() {
           identityTimeline,
           input.topic,
           {
-            contactName: input.contactName, // Optional contact-scoped filtering
+            contactName: extractedContactName, // Use extracted contact name
             maxMessages: 300, // Pull many, budget will trim
           },
         )
@@ -1673,7 +1715,7 @@ function registerIpcHandlers() {
         console.log('[WriteLikeMe] Retrieval stats:', {
           mode,
           topic: input.topic,
-          contactName: input.contactName ?? '(none)',
+          contactName: extractedContactName ?? '(none)',
           sms: {
             totalCandidates: smsRetrieval.stats.totalCandidates,
             topicMatches: smsRetrieval.stats.topicMatches,
@@ -1702,6 +1744,26 @@ function registerIpcHandlers() {
           estimatedTokens: budgeted.estimatedTokens,
         })
 
+        // Load recent conversation memory for context
+        const { 
+          loadConversations, 
+          formatConversationMemory, 
+          saveConversation,
+          generateConversationId,
+        } = await import('./writeAgentMemory.js')
+        const recentConversations = await loadConversations()
+        const conversationMemoryBlock = formatConversationMemory(recentConversations)
+
+        // Load relevant knowledge facts
+        const { 
+          loadKnowledgeStore, 
+          getRelevantEntities, 
+          formatEntitiesForPrompt 
+        } = await import('./knowledgeStore.js')
+        const knowledgeStore = await loadKnowledgeStore()
+        const relevantEntities = getRelevantEntities(knowledgeStore, input.topic, extractedContactName)
+        const knowledgeFactsBlock = formatEntitiesForPrompt(relevantEntities)
+
         const prompt = buildWriteLikeMePrompt({
           handle: input.handle,
           topic: input.topic,
@@ -1712,6 +1774,8 @@ function registerIpcHandlers() {
           identityProfile,
           crossPlatformSamples: [], // Replaced by full retrieval pipeline
           contactProfile, // Only loaded when contactName was specified
+          conversationMemory: conversationMemoryBlock,
+          knowledgeFacts: knowledgeFactsBlock,
         })
 
         const geminiModel = getGeminiModel(model)
@@ -1735,6 +1799,23 @@ function registerIpcHandlers() {
           timeoutMs,
           'Gemini write stream',
         )
+
+        // Save conversation to memory for future context
+        await saveConversation({
+          id: generateConversationId(),
+          timestamp: new Date().toISOString(),
+          topic: input.topic,
+          contactName: extractedContactName,
+          request: input.topic,
+          response: streamedText,
+          voiceMode: mode,
+          metadata: {
+            hadInsufficientData: !contactProfile && !!extractedContactName,
+            dataNote: !contactProfile && !!extractedContactName 
+              ? `No contact profile found for ${extractedContactName}` 
+              : undefined,
+          },
+        })
 
         sendDone({ text: streamedText, model })
         return { text: streamedText, model }

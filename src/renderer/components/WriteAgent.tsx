@@ -75,7 +75,7 @@ export default function WriteAgent({ lockedDate = null }: Props) {
               className="min-h-[120px] w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white placeholder:text-white/40 outline-none focus:border-indigo-400/60"
               value={topic}
               onChange={(e) => setTopic(e.target.value)}
-              placeholder="Example: reply to a client who asked for a project timeline"
+              placeholder="Example: Write a letter to Kevin about my new job"
             />
           </div>
 

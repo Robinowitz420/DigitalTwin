@@ -1,5 +1,5 @@
 import type { RedditDataset, RedditImportProgress } from '../types/reddit.types.js'
-import { analyzeVoice, type VoiceProfile } from '../analysis/voiceAnalyzer.js'
+import { analyzeVoice, type VoiceProfile, type PerContactVoiceProfile } from '../analysis/voiceAnalyzer.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { loadIdentityTimeline } from './identityStore.js'
 import {
@@ -9,6 +9,19 @@ import {
   createInitialCheckpoint,
 } from './voiceCheckpointStore.js'
 import type { VoiceTrainingCheckpoint, VoiceTrainingControl } from '../types/voiceTraining.types.js'
+import {
+  getGraniteClient,
+  isGraniteAvailable,
+  type ChunkStyleDistillation,
+  type ContactConversationSummary,
+} from '../ai/graniteClient.js'
+import { saveContactProfile } from './contactProfileStore.js'
+import { 
+  loadKnowledgeStore, 
+  saveKnowledgeStore, 
+  upsertEntities,
+} from './knowledgeStore.js'
+import { extractFactsFromConversation, isOllamaRunning } from './memory/ollamaClient.js'
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   if (!Number.isFinite(ms) || ms <= 0) return promise
@@ -661,4 +674,460 @@ ${JSON.stringify({
   await clearVoiceCheckpoint()
   
   return profile
+}
+
+/**
+ * Train voice profile using IBM Granite (via watsonx API)
+ * This version creates comprehensive profiles with per-contact style analysis
+ */
+export async function trainVoiceWithGranite(
+  dataset: RedditDataset,
+  opts: {
+    onProgress?: (p: RedditImportProgress) => void
+    timeoutMs?: number
+    resumeFromCheckpoint?: boolean
+    control?: VoiceTrainingControl
+    includeContactProfiles?: boolean
+  },
+): Promise<VoiceProfile> {
+  const granite = getGraniteClient()
+  if (!granite) {
+    throw new Error('Granite unavailable. Set WATSONX_API_KEY and WATSONX_PROJECT_ID in .env.local')
+  }
+
+  const minTextLen = 50
+  const chunkSize = 25
+  const maxChunkChars = 12_000
+  const maxItemChars = 800
+  const maxItems = 8000
+
+  // Load identity timeline for cross-platform data
+  const identityTimeline = await loadIdentityTimeline()
+  const identityEvents = identityTimeline?.events ?? []
+
+  // Collect all outbound messages from all sources
+  const comments = dataset.comments
+    .map((c) => ({ text: (c.body ?? '').trim(), score: c.score ?? 0, source: 'reddit' as const }))
+    .filter((c) => c.text.length > 0 && isHighQualityText(c.text, minTextLen))
+
+  const posts = dataset.posts
+    .map((p) => ({ text: `${p.title ?? ''}\n${p.body ?? ''}`.trim(), score: p.score ?? 0, source: 'reddit' as const }))
+    .filter((p) => p.text.length > 0 && isHighQualityText(p.text, minTextLen))
+
+  const smsMessages = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'sms' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0, source: 'sms' as const }))
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
+
+  const instagramMessages = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'instagram' && e.kind === 'message' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0, source: 'instagram' as const }))
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
+
+  const instagramComments = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'instagram' && e.kind === 'comment'
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0, source: 'instagram' as const }))
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
+
+  const llmChatMessages = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'llm_chat' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0, source: 'llm_chat' as const }))
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
+
+  // Gmail sent emails
+  const gmailSent = identityEvents
+    .filter((e): e is import('../types/identity.types.js').IdentityEvent => 
+      e.source === 'gmail' && e.metadata?.isUserMessage === true
+    )
+    .map(e => ({ text: (e.text ?? '').trim(), score: 0, source: 'gmail' as const }))
+    .filter(m => m.text.length > 0 && isHighQualityText(m.text, minTextLen))
+
+  // Compute local baseline using deterministic analysis
+  const localBaseline = analyzeVoice({
+    comments: [
+      ...dataset.comments.map((c) => ({ body: c.body ?? '', score: c.score ?? undefined })),
+      ...smsMessages.map(m => ({ body: m.text, score: undefined })),
+      ...instagramMessages.map(m => ({ body: m.text, score: undefined })),
+      ...instagramComments.map(m => ({ body: m.text, score: undefined })),
+      ...llmChatMessages.map(m => ({ body: m.text, score: undefined })),
+      ...gmailSent.map(m => ({ body: m.text, score: undefined })),
+    ],
+    posts: dataset.posts.map((p) => ({
+      title: p.title ?? '',
+      body: p.body ?? '',
+      score: p.score ?? undefined,
+    })),
+  })
+
+  // Score and sort all content
+  const allScored = [...comments, ...posts, ...smsMessages, ...instagramMessages, ...instagramComments, ...llmChatMessages, ...gmailSent]
+    .map(item => ({ ...item, qualityScore: scoreContent(item) }))
+    .sort((a, b) => b.qualityScore - a.qualityScore || b.score - a.score)
+    .slice(0, maxItems)
+
+  // Chunk for Granite analysis
+  const chunks = chunkBySizeAndChars(allScored, chunkSize, maxChunkChars, maxItemChars)
+  console.log('[GraniteTrainer] Training set', {
+    totalItems: allScored.length,
+    chunks: chunks.length,
+    sources: {
+      reddit: comments.length + posts.length,
+      sms: smsMessages.length,
+      instagram: instagramMessages.length + instagramComments.length,
+      llm: llmChatMessages.length,
+      gmail: gmailSent.length,
+    },
+  })
+
+  if (chunks.length === 0) {
+    throw new Error('Not enough quality content to train a voice profile.')
+  }
+
+  const total = chunks.length
+  const chunkSummaries: ChunkStyleDistillation[] = []
+
+  // Process each chunk with Granite
+  for (let i = 0; i < chunks.length; i++) {
+    // Check for pause/abort
+    while (trainingPaused && !trainingAborted) {
+      await new Promise(r => setTimeout(r, 500))
+      opts.onProgress?.({
+        stage: 'training',
+        percent: 85 * (i / total),
+        message: `Training paused at chunk ${i}/${total}. Click Resume to continue.`,
+      })
+    }
+
+    if (trainingAborted) {
+      throw new Error('Training aborted by user')
+    }
+
+    const percent = 85 * ((i + 1) / total)
+    opts.onProgress?.({
+      stage: 'training',
+      percent: Math.max(1, Math.min(85, percent)),
+      message: `Granite analyzing your writing… (chunk ${i + 1}/${total})`,
+    })
+
+    const samples = chunks[i].map(x => x.text)
+    
+    try {
+      const distillation = await granite.analyzeWritingChunk(samples)
+      if (distillation) {
+        chunkSummaries.push(distillation)
+      }
+    } catch (e) {
+      console.warn('[GraniteTrainer] Chunk analysis failed:', e)
+      // Continue with other chunks
+    }
+  }
+
+  if (chunkSummaries.length === 0) {
+    console.warn('[GraniteTrainer] All chunks failed, using local baseline')
+    return localBaseline
+  }
+
+  opts.onProgress?.({ stage: 'training', percent: 90, message: 'Consolidating voice profile with Granite…' })
+
+  // Consolidate chunk summaries into final profile
+  const consolidated = await granite.consolidateVoiceProfile({
+    chunkSummaries,
+    localBaseline: {
+      avgLength: localBaseline.avgLength,
+      medianLength: localBaseline.medianLength,
+      totalComments: localBaseline.totalComments,
+    },
+    totalSamples: allScored.length,
+  })
+
+  // Build final profile, grounding key fields in local baseline
+  const profile: VoiceProfile = {
+    ...localBaseline,
+    ...(consolidated ?? {}),
+    // Keep these from local baseline (deterministic)
+    avgLength: localBaseline.avgLength,
+    medianLength: localBaseline.medianLength,
+    totalComments: localBaseline.totalComments,
+    commonPhrases: localBaseline.commonPhrases,
+    signatureWords: localBaseline.signatureWords,
+    starterPhrases: localBaseline.starterPhrases,
+    closingPhrases: localBaseline.closingPhrases,
+    representativeExamples: localBaseline.representativeExamples,
+    highEngagementExamples: localBaseline.highEngagementExamples,
+  }
+
+  // Record training metadata
+  profile.trainedAt = new Date().toISOString()
+  profile.trainingSources = {
+    redditComments: dataset.comments.length,
+    redditPosts: dataset.posts.length,
+    smsMessages: smsMessages.length,
+    instagramMessages: instagramMessages.length,
+    instagramComments: instagramComments.length,
+    llmChatMessages: llmChatMessages.length,
+  }
+
+  // Build per-contact profiles if requested
+  if (opts.includeContactProfiles !== false) {
+    opts.onProgress?.({ stage: 'training', percent: 95, message: 'Building per-contact style profiles…' })
+    await buildPerContactProfilesWithGranite(granite, identityEvents, opts.onProgress)
+  }
+
+  // Extract facts from all conversations using Ollama (free, local)
+  await extractFactsWithOllama(identityEvents, comments, posts)
+
+  return profile
+}
+
+/**
+ * Build per-contact profiles using Granite
+ */
+async function buildPerContactProfilesWithGranite(
+  granite: NonNullable<ReturnType<typeof getGraniteClient>>,
+  identityEvents: import('../types/identity.types.js').IdentityEvent[],
+  onProgress?: (p: RedditImportProgress) => void,
+): Promise<void> {
+  // Group SMS by contact
+  const smsByContact = new Map<string, Array<{ from: 'user' | 'contact'; text: string; timestamp?: string }>>()
+  
+  for (const e of identityEvents) {
+    if (e.source !== 'sms') continue
+    const rawName = e.metadata?.contactName ?? e.participants?.find(p => p !== 'Me')
+    if (!rawName || rawName === 'Unknown' || typeof rawName !== 'string') continue
+    const contactName: string = rawName
+    
+    const existing = smsByContact.get(contactName) ?? []
+    existing.push({
+      from: e.metadata?.isUserMessage ? 'user' : 'contact',
+      text: e.text ?? '',
+      timestamp: e.createdAt ?? undefined,
+    })
+    smsByContact.set(contactName, existing)
+  }
+
+  // Filter to contacts with enough conversation
+  const significantContacts = [...smsByContact.entries()]
+    .filter(([, msgs]) => msgs.length >= 10 && msgs.filter(m => m.from === 'user').length >= 5)
+  
+  console.log(`[GraniteTrainer] Building profiles for ${significantContacts.length} contacts`)
+
+  let processed = 0
+  for (const [contactName, messages] of significantContacts) {
+    const userMessages = messages.filter(m => m.from === 'user').map(m => m.text)
+    const contactMessages = messages.filter(m => m.from === 'contact').map(m => m.text)
+
+    try {
+      const summary = await granite.analyzeContactConversation({
+        contactName,
+        userMessages,
+        contactMessages,
+        allMessages: messages,
+      })
+
+      if (summary) {
+        // Convert to PerContactVoiceProfile format
+        const profile: PerContactVoiceProfile = {
+          contactName: summary.contactName,
+          relationshipType: summary.relationshipType,
+          intimacyScore: 0.5, // Would need to compute from messages
+          userStyle: {
+            avgMessageLength: userMessages.reduce((s, m) => s + m.length, 0) / Math.max(1, userMessages.length),
+            emojiUsageRate: 0,
+            slangUsageRate: 0,
+            questionRate: 0,
+            exclamationRate: 0,
+            initiationsCount: 0,
+          },
+          contactStyle: {
+            avgMessageLength: contactMessages.reduce((s, m) => s + m.length, 0) / Math.max(1, contactMessages.length),
+            emojiUsageRate: 0,
+            slangUsageRate: 0,
+          },
+          sharedPhrases: summary.sharedJokes ?? [],
+          topicsDiscussed: (summary.recurringTopics ?? []).map(t => ({ topic: t, count: 1 })),
+          totalMessages: messages.length,
+          userMessages: userMessages.length,
+          contactMessages: contactMessages.length,
+          firstMessageDate: messages[0]?.timestamp ?? null,
+          lastMessageDate: messages[messages.length - 1]?.timestamp ?? null,
+          representativeUserMessages: userMessages.slice(0, 10),
+          representativeContactMessages: contactMessages.slice(0, 10),
+          // Store Granite's narrative analysis
+          _graniteSummary: summary,
+        } as PerContactVoiceProfile & { _graniteSummary: ContactConversationSummary }
+
+        await saveContactProfile(profile)
+        processed++
+        
+        onProgress?.({
+          stage: 'training',
+          percent: 95 + (5 * processed / significantContacts.length),
+          message: `Analyzed conversation style with ${contactName}…`,
+        })
+      }
+    } catch (e) {
+      console.warn(`[GraniteTrainer] Failed to analyze contact ${contactName}:`, e)
+    }
+  }
+
+  console.log(`[GraniteTrainer] Built ${processed} contact profiles`)
+}
+
+/**
+ * Extract facts from conversations using Ollama (free, local)
+ */
+async function extractFactsWithOllama(
+  identityEvents: import('../types/identity.types.js').IdentityEvent[],
+  redditComments: Array<{ text: string }>,
+  redditPosts: Array<{ text: string }>,
+): Promise<void> {
+  // Check if Ollama is running
+  if (!(await isOllamaRunning())) {
+    console.log('[VoiceTrainer] Ollama not running - skipping fact extraction')
+    return
+  }
+  
+  console.log('[VoiceTrainer] Extracting facts from conversations using Ollama…')
+  
+  // Group SMS by contact
+  const smsByContact = new Map<string, Array<{ isUserMessage: boolean; text: string; timestamp?: string; senderName: string }>>()
+  
+  for (const e of identityEvents) {
+    if (e.source !== 'sms') continue
+    const rawName = e.metadata?.contactName ?? e.participants?.find(p => p !== 'Me')
+    if (!rawName || rawName === 'Unknown' || typeof rawName !== 'string') continue
+    const contactName: string = rawName
+    
+    const existing = smsByContact.get(contactName) ?? []
+    existing.push({
+      isUserMessage: e.metadata?.isUserMessage === true,
+      text: e.text ?? '',
+      timestamp: e.createdAt ?? undefined,
+      senderName: e.metadata?.isUserMessage ? 'Me' : contactName,
+    })
+    smsByContact.set(contactName, existing)
+  }
+  
+  try {
+    const knowledgeStore = await loadKnowledgeStore()
+    const existingEntities = knowledgeStore.entities.map(e => ({
+      canonicalName: e.canonicalName,
+      type: e.type,
+      aliases: e.aliases,
+    }))
+    
+    // Extract facts from SMS conversations
+    const smsChunks: Array<{ text: string; sourceType: string; contactName?: string; date?: string }> = []
+    for (const [contactName, messages] of smsByContact.entries()) {
+      if (messages.length < 5) continue
+      const text = messages
+        .slice(-30)
+        .map(m => `[${m.timestamp ?? 'unknown'}] ${m.isUserMessage ? 'Me' : m.senderName}: ${m.text}`)
+        .join('\n')
+      if (text.length >= 100) {
+        smsChunks.push({
+          text,
+          sourceType: 'sms',
+          contactName,
+          date: messages[messages.length - 1]?.timestamp ?? undefined,
+        })
+      }
+    }
+    
+    // Extract facts from Reddit posts/comments
+    const redditChunks: Array<{ text: string; sourceType: string; contactName?: string; date?: string }> = []
+    for (const item of redditComments.slice(0, 50)) {
+      redditChunks.push({
+        text: item.text,
+        sourceType: 'reddit',
+        contactName: undefined,
+        date: undefined,
+      })
+    }
+    for (const item of redditPosts.slice(0, 20)) {
+      redditChunks.push({
+        text: item.text,
+        sourceType: 'reddit',
+        contactName: undefined,
+        date: undefined,
+      })
+    }
+    
+    // Process all chunks
+    const allChunks = [...smsChunks, ...redditChunks]
+    let extracted = 0
+    
+    for (let i = 0; i < allChunks.length; i++) {
+      const chunk = allChunks[i]
+      try {
+        const facts = await extractFactsFromConversation({
+          conversationText: chunk.text,
+          sourceType: chunk.sourceType,
+          contactName: chunk.contactName,
+          existingEntities: [...existingEntities, ...knowledgeStore.entities.map(e => ({
+            canonicalName: e.canonicalName,
+            type: e.type,
+            aliases: e.aliases,
+          }))],
+        })
+        
+        if (facts.length > 0) {
+          await upsertEntities(knowledgeStore, facts, {
+            source: chunk.sourceType as import('../types/identity.types.js').IdentitySource,
+            date: chunk.date ?? new Date().toISOString(),
+            context: chunk.text.slice(0, 500),
+            contactName: chunk.contactName,
+          })
+          extracted += facts.length
+        }
+      } catch (e) {
+        console.warn(`[VoiceTrainer] Failed to extract facts from chunk ${i}:`, e)
+      }
+    }
+    
+    await saveKnowledgeStore(knowledgeStore)
+    console.log(`[VoiceTrainer] Extracted ${extracted} facts from ${allChunks.length} chunks using Ollama`)
+  } catch (e) {
+    console.warn('[VoiceTrainer] Failed to extract facts:', e)
+  }
+}
+
+/**
+ * Unified voice training entry point
+ * Uses Granite if available, falls back to Gemini
+ */
+export async function trainVoice(
+  dataset: RedditDataset,
+  opts: {
+    onProgress?: (p: RedditImportProgress) => void
+    timeoutMs?: number
+    resumeFromCheckpoint?: boolean
+    control?: VoiceTrainingControl
+    includeContactProfiles?: boolean
+    preferGranite?: boolean
+  },
+): Promise<VoiceProfile> {
+  const useGranite = opts.preferGranite !== false && isGraniteAvailable()
+  
+  if (useGranite) {
+    console.log('[VoiceTrainer] Using Granite for voice training')
+    return trainVoiceWithGranite(dataset, opts)
+  } else {
+    console.log('[VoiceTrainer] Using Gemini for voice training (Granite unavailable)')
+    return trainVoiceWithGemini(dataset, {
+      model: process.env.GEMINI_MODEL ?? 'gemini-2.5-flash',
+      onProgress: opts.onProgress,
+      timeoutMs: opts.timeoutMs,
+      resumeFromCheckpoint: opts.resumeFromCheckpoint,
+      control: opts.control,
+    })
+  }
 }
