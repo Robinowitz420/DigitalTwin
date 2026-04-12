@@ -79,6 +79,7 @@ type BuildPromptInput = {
   contactProfile?: PerContactVoiceProfile | null
   conversationMemory?: string
   knowledgeFacts?: string
+  clusterContext?: string // MemPalace-style cluster summary
 }
 
 export function buildWriteLikeMePrompt(input: BuildPromptInput) {
@@ -269,7 +270,7 @@ ${identitySummary}
 RELEVANT CROSS-PLATFORM SIGNALS FOR THIS TOPIC:
 ${crossSamples || '(none)'}
 
-${input.conversationMemory ? input.conversationMemory + '\n' : ''}${input.knowledgeFacts ? input.knowledgeFacts + '\n\n' : ''}PERSONALITY ADJUSTMENTS FOR THIS RESPONSE:
+${input.conversationMemory ? input.conversationMemory + '\n' : ''}${input.knowledgeFacts ? input.knowledgeFacts + '\n\n' : ''}${input.clusterContext ? `MEMORY CONTEXT (MemPalace-style retrieval):\n${input.clusterContext}\n\n` : ''}PERSONALITY ADJUSTMENTS FOR THIS RESPONSE:
 - Formality: ${sliderInstruction('formality', input.sliders.formality)}
 - Assertiveness: ${sliderInstruction('assertiveness', input.sliders.assertiveness)}
 - Verbosity: ${sliderInstruction('verbosity', input.sliders.verbosity)}

@@ -15,6 +15,7 @@ import type {
 import { loadVoiceProfile, clearVoiceProfile } from './voiceProfileStore.js'
 import { saveVoiceProfile } from './voiceProfileStore.js'
 import { getContactProfile } from './contactProfileStore.js'
+import { retrieveWithClusterRouting, buildAllContactClusters, formatClusterForPrompt } from './memory/clusterRetrieval.js'
 import { trainVoice, createTrainingControl } from './voiceTrainer.js'
 import { loadVoiceCheckpoint } from './voiceCheckpointStore.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
@@ -1764,6 +1765,30 @@ function registerIpcHandlers() {
         const relevantEntities = getRelevantEntities(knowledgeStore, input.topic, extractedContactName)
         const knowledgeFactsBlock = formatEntitiesForPrompt(relevantEntities)
 
+        // MemPalace-style cluster-based retrieval for contact-specific context
+        let clusterContextBlock = ''
+        if (extractedContactName && identityTimeline?.events) {
+          // Build cluster memory for this contact on-the-fly
+          const clusterMemory = buildAllContactClusters(identityTimeline.events).get(extractedContactName)
+          if (clusterMemory) {
+            const clusterResult = retrieveWithClusterRouting(
+              identityTimeline.events,
+              extractedContactName,
+              input.topic,
+              clusterMemory,
+              { maxMessages: 30 }
+            )
+            clusterContextBlock = formatClusterForPrompt(clusterResult)
+            
+            console.log('[WriteLikeMe] Cluster retrieval:', {
+              contact: extractedContactName,
+              cluster: clusterResult.cluster,
+              confidence: Math.round(clusterResult.confidence * 100) + '%',
+              messages: clusterResult.stats.finalCount
+            })
+          }
+        }
+
         const prompt = buildWriteLikeMePrompt({
           handle: input.handle,
           topic: input.topic,
@@ -1776,6 +1801,7 @@ function registerIpcHandlers() {
           contactProfile, // Only loaded when contactName was specified
           conversationMemory: conversationMemoryBlock,
           knowledgeFacts: knowledgeFactsBlock,
+          clusterContext: clusterContextBlock, // MemPalace-style cluster summary
         })
 
         const geminiModel = getGeminiModel(model)
